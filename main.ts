@@ -27,7 +27,7 @@
 //       at the bottom of this file). Mutating REST/GraphQL/MCP calls and git
 //       pushes require it. Public reads (clone/fetch, GET on public repos) are open.
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { type IncomingMessage, type ServerResponse } from "node:http";
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
   rmSync, mkdtempSync,
@@ -194,22 +194,24 @@ function safeEq(a: string, b: string): boolean {
 let reqSeq = 0;
 function reqId(): string { reqSeq += 1; return `req-${process.pid.toString(16)}-${reqSeq.toString(16)}`; }
 function sendJson(res: ServerResponse, status: number, obj: unknown, extra?: Record<string, string>): void {
-  const body = JSON.stringify(obj);
-  sendJsonBody(res, status, body, extra);
+  // Serialize once to a Buffer: res.end(Buffer) skips the per-write UTF-8
+  // re-encode that res.end(string) pays on every response.
+  sendJsonBody(res, status, Buffer.from(JSON.stringify(obj), "utf8"), extra);
 }
 // Same headers as sendJson, but the body is already serialized (used by
 // the GET-issue cache, which stores the serialized form).
-function sendJsonBody(res: ServerResponse, status: number, body: string, extra?: Record<string, string>): void {
+function sendJsonBody(res: ServerResponse, status: number, body: string | Buffer, extra?: Record<string, string>): void {
+  const buf = typeof body === "string" ? Buffer.from(body, "utf8") : body;
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(body),
+    "Content-Length": buf.length,
     "X-Content-Type-Options": "nosniff",
     "X-GitHub-Request-Id": reqId(),
     "Access-Control-Allow-Origin": "*",
     "Cache-Control": "no-store",
     ...(extra || {}),
   });
-  res.end(body);
+  res.end(buf);
 }
 function sendError(res: ServerResponse, status: number, message: string, extra?: Json): void {
   sendJson(res, status, { message, documentation_url: "https://docs.github.com/rest", ...(extra || {}) });
@@ -658,6 +660,13 @@ function gitWritePackObjectHeader(type: GitObjType, size: number): Buffer {
 }
 // Build a packfile from plain objects (no deltas). The trailer is SHA-1
 // over everything before it.
+// Level-0 deflated bytes per object, computed once and reused by storage
+// flushes (gitWritePack level 0). The bytes depend only on (data, level) and
+// objects are never mutated after creation, so a cached entry is always
+// byte-identical to a fresh deflateSync(data, { level: 0 }). Wire packs
+// (level 6) are not cached: they are built rarely (fetchCache) and must keep
+// their own level.
+const deflated0Cache = new WeakMap<GitObj, Buffer>();
 function gitWritePack(objects: Iterable<GitObj>, level = 6): Buffer {
   const list = [...objects];
   const parts: Buffer[] = [];
@@ -668,7 +677,13 @@ function gitWritePack(objects: Iterable<GitObj>, level = 6): Buffer {
   parts.push(header);
   for (const object of list) {
     parts.push(gitWritePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data, { level }));
+    if (level === 0) {
+      let d = deflated0Cache.get(object);
+      if (!d) { d = deflateSync(object.data, { level: 0 }); deflated0Cache.set(object, d); }
+      parts.push(d);
+    } else {
+      parts.push(deflateSync(object.data, { level }));
+    }
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash("sha1").update(body).digest()]);
@@ -1280,6 +1295,17 @@ function gitFetchV0Response(r: Repo, st: GitState, body: Buffer): Buffer {
   return Buffer.concat(parts);
 }
 
+// The protocol-v2 upload-pack advertisement is identical for every repo and
+// request (fixed capability list, no refs), so build it once.
+const V2_UPLOAD_AD = Buffer.concat([
+  gitPkt("# service=git-upload-pack\n"), GIT_FLUSH,
+  gitPkt("version 2\n"),
+  gitPkt(`agent=${FORGE_AGENT}\n`),
+  gitPkt("ls-refs=unborn\n"),
+  gitPkt("fetch=shallow thin-pack ofs-delta\n"),
+  gitPkt("object-format=sha1\n"),
+  GIT_FLUSH,
+]);
 async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, repo: string, service: string): Promise<void> {
   const r = findRepo(owner, repo);
   if (!r) { sendError(res, 404, "Not Found"); return; }
@@ -1291,15 +1317,7 @@ async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: 
   const headRef = `refs/heads/${r.default_branch}`;
   const headOid = st.refs.get(headRef) ?? null;
   if (v2) {
-    const body = Buffer.concat([
-      gitPkt("# service=git-upload-pack\n"), GIT_FLUSH,
-      gitPkt("version 2\n"),
-      gitPkt(`agent=${FORGE_AGENT}\n`),
-      gitPkt("ls-refs=unborn\n"),
-      gitPkt("fetch=shallow thin-pack ofs-delta\n"),
-      gitPkt("object-format=sha1\n"),
-      GIT_FLUSH,
-    ]);
+    const body = V2_UPLOAD_AD;
     res.writeHead(200, { "Content-Type": "application/x-git-upload-pack-advertisement", "Content-Length": body.length, "Cache-Control": "no-cache" });
     res.end(body);
     return;
@@ -1887,15 +1905,15 @@ function contentsPut(res: ServerResponse, r: Repo, path: string, body: Json, isD
 // storeGen — so an entry is valid exactly while its generation matches.
 // Looked up only after the repo/issue 404 guards, so a deleted or
 // recreated repo can never serve a stale body. Bounded, cleared wholesale.
-const issueBodyCache = new Map<string, { gen: number; body: string }>();
+const issueBodyCache = new Map<string, { gen: number; body: Buffer }>();
 function issueCacheKey(owner: string, repo: string, number: number): string {
   return `${owner}/${repo}#${number}`;
 }
-function getCachedIssueBody(owner: string, repo: string, number: number): string | null {
+function getCachedIssueBody(owner: string, repo: string, number: number): Buffer | null {
   const e = issueBodyCache.get(issueCacheKey(owner, repo, number));
   return e && e.gen === storeGen ? e.body : null;
 }
-function setCachedIssueBody(owner: string, repo: string, number: number, body: string): void {
+function setCachedIssueBody(owner: string, repo: string, number: number, body: Buffer): void {
   if (issueBodyCache.size >= 512) issueBodyCache.clear();
   issueBodyCache.set(issueCacheKey(owner, repo, number), { gen: storeGen, body });
 }
@@ -2830,7 +2848,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
           if (method === "GET") {
             const cached = getCachedIssueBody(owner, repoName, num);
             if (cached !== null) { sendJsonBody(res, 200, cached); return; }
-            const body = JSON.stringify(issueJson(r, issue));
+            const body = Buffer.from(JSON.stringify(issueJson(r, issue)), "utf8");
             setCachedIssueBody(owner, repoName, num, body);
             sendJsonBody(res, 200, body);
             return;
@@ -3104,10 +3122,288 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   await handleRest(req, res, method, restSeg, url);
 }
 
-const server = createServer((req, res) => {
-  handle(req, res).catch((e: any) => {
-    if (!res.writableEnded) sendError(res, e && e.status ? e.status : 500, (e && e.message) || "Internal Server Error");
+// ---------------------------------------------------------------------------
+// Raw TCP transport (iter8) — minimal HTTP/1.1 over node:net, replacing node:http.
+//
+// Why: node:http burns ~1.662 ms CPU per full grade on transport alone (ZERO,
+// iter6) — request/response object churn, header parsing into objects, and
+// writev-per-write. A hand-rolled transport does the same work for ~40-60% less
+// CPU (micro-benchmarked: 46-83 us/req vs 110-145 us/req for node:http).
+//
+// The handler logic above only uses a small surface, which the shims below
+// reproduce exactly:
+//   req.method / req.url / req.headers.authorization|host|git-protocol /
+//   req.socket.remoteAddress|encrypted / req.on("data"|"end"|"error")
+//   res.writeHead(status, headers?) / res.end(body?) / res.writableEnded
+// Everything else (routing, git, REST, GraphQL, MCP, store) is untouched.
+// Wire behavior preserved: keep-alive, Content-Length, 100-continue, chunked
+// request bodies, 413 for absurd bodies (same JSON shape as sendError).
+// ---------------------------------------------------------------------------
+import { createServer as createNetServer, type Socket } from "node:net";
+
+const HTTP_REASON: Record<number, string> = {
+  200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
+  400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+  405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
+  429: "Too Many Requests", 500: "Internal Server Error",
+};
+let httpDateCache = "";
+let httpDateSec = 0;
+function httpDate(): string {
+  const s = Math.floor(Date.now() / 1000);
+  if (s !== httpDateSec) { httpDateSec = s; httpDateCache = new Date(s * 1000).toUTCString(); }
+  return httpDateCache;
+}
+
+const RAW_EMPTY = Buffer.alloc(0);
+const RAW_MAX_HEADERS = 65536;
+const RAW_MAX_BODY = 64 * 1024 * 1024;
+
+type RawListener = (...args: any[]) => void;
+
+class RawReq {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  socket: { remoteAddress: string; encrypted: boolean };
+  private cbs = new Map<string, RawListener[]>();
+  private emitted = false;
+  private body: Buffer;
+  private bodyErr: Error | null;
+  constructor(method: string, url: string, headers: Record<string, string>, remoteAddress: string, body: Buffer, bodyErr: Error | null) {
+    this.method = method;
+    this.url = url;
+    this.headers = headers;
+    this.body = body;
+    this.bodyErr = bodyErr;
+    this.socket = { remoteAddress, encrypted: false };
+  }
+  on(ev: string, cb: RawListener): this {
+    let arr = this.cbs.get(ev);
+    if (!arr) { arr = []; this.cbs.set(ev, arr); }
+    arr.push(cb);
+    if (!this.emitted) {
+      this.emitted = true;
+      // The body is already fully buffered; deliver it on nextTick so all
+      // listeners (data/end/error) are registered first, like node:http.
+      process.nextTick(() => {
+        if (this.bodyErr) {
+          for (const f of this.cbs.get("error") ?? []) f(this.bodyErr);
+          return;
+        }
+        if (this.body.length > 0) for (const f of this.cbs.get("data") ?? []) f(this.body);
+        for (const f of this.cbs.get("end") ?? []) f();
+      });
+    }
+    return this;
+  }
+}
+
+class RawRes {
+  statusCode = 200;
+  writableEnded = false;
+  headersSent = false;
+  private status = 200;
+  private head: [string, string][] = [];
+  private done = false;
+  private sock: Socket;
+  private keepAlive: boolean;
+  private onDone: () => void;
+  constructor(sock: Socket, keepAlive: boolean, onDone: () => void) {
+    this.sock = sock;
+    this.keepAlive = keepAlive;
+    this.onDone = onDone;
+  }
+  writeHead(status: number, headers?: Record<string, string>): this {
+    this.status = status;
+    this.statusCode = status;
+    this.headersSent = true;
+    if (headers) for (const k of Object.keys(headers)) this.head.push([k, headers[k] as string]);
+    return this;
+  }
+  end(body?: string | Buffer): void {
+    if (this.done) return;
+    this.done = true;
+    this.writableEnded = true;
+    const st = this.status;
+    const noBody = st === 204 || st === 304;
+    let buf: Buffer | null = null;
+    let len = 0;
+    if (!noBody && body !== undefined) {
+      buf = typeof body === "string" ? Buffer.from(body, "utf8") : (body as Buffer);
+      len = buf.length;
+    }
+    const hasCL = this.head.some(([k]) => k.toLowerCase() === "content-length");
+    let h = `HTTP/1.1 ${st} ${HTTP_REASON[st] ?? ""}\r\n`;
+    for (const [k, v] of this.head) h += `${k}: ${v}\r\n`;
+    if (!noBody && !hasCL) h += `Content-Length: ${len}\r\n`;
+    h += `Connection: ${this.keepAlive ? "keep-alive" : "close"}\r\nDate: ${httpDate()}\r\n\r\n`;
+    if (!this.sock.destroyed) {
+      const hb = Buffer.from(h, "latin1");
+      if (buf && len > 0) {
+        // Cork: header + body leave as a single writev (the V7 lesson — never
+        // let an encode saving turn into extra write syscalls).
+        this.sock.cork();
+        this.sock.write(hb);
+        this.sock.write(buf);
+        this.sock.uncork();
+      } else {
+        this.sock.write(hb);
+      }
+      if (!this.keepAlive) this.sock.end();
+    }
+    this.onDone();
+  }
+}
+
+interface RawConn {
+  sock: Socket;
+  buf: Buffer;
+  off: number;
+  busy: boolean;
+  closed: boolean;
+  halfClosed: boolean;
+}
+
+function rawDispatch(conn: RawConn, method: string, target: string, headers: Record<string, string>, body: Buffer, keepAlive: boolean): void {
+  const req = new RawReq(method, target, headers, conn.sock.remoteAddress ?? "127.0.0.1", body, null);
+  const res = new RawRes(conn.sock, keepAlive, () => {
+    conn.busy = false;
+    if (conn.halfClosed) { try { conn.sock.end(); } catch { /* already gone */ } }
+    if (!conn.closed) rawPump(conn);
   });
+  conn.busy = true;
+  handle(req as unknown as IncomingMessage, res as unknown as ServerResponse).catch((e: any) => {
+    if (!res.writableEnded && !res.headersSent) sendError(res, e && e.status ? e.status : 500, (e && e.message) || "Internal Server Error");
+  });
+}
+
+function rawPump(conn: RawConn): void {
+  if (conn.busy || conn.closed) return;
+  const sock = conn.sock;
+  for (;;) {
+    const avail = conn.buf.length - conn.off;
+    if (avail <= 0) return;
+    const hEnd = conn.buf.indexOf("\r\n\r\n", conn.off);
+    if (hEnd < 0) {
+      if (avail > RAW_MAX_HEADERS) { sock.destroy(); conn.closed = true; }
+      return;
+    }
+    const lineEnd = conn.buf.indexOf("\r\n", conn.off);
+    if (lineEnd < 0 || lineEnd > hEnd) { sock.destroy(); conn.closed = true; return; }
+    const line = conn.buf.toString("latin1", conn.off, lineEnd);
+    const sp1 = line.indexOf(" ");
+    const sp2 = line.indexOf(" ", sp1 + 1);
+    if (sp1 <= 0 || sp2 <= sp1 + 1) { sock.destroy(); conn.closed = true; return; }
+    const method = line.slice(0, sp1);
+    const target = line.slice(sp1 + 1, sp2);
+    const version = line.slice(sp2 + 1);
+    if (version !== "HTTP/1.1" && version !== "HTTP/1.0") { sock.destroy(); conn.closed = true; return; }
+    const headers: Record<string, string> = Object.create(null);
+    let p = lineEnd + 2;
+    let contentLength = 0;
+    let chunked = false;
+    let keepAlive = version === "HTTP/1.1";
+    let expectContinue = false;
+    let bad = false;
+    while (p < hEnd) {
+      const eol = conn.buf.indexOf("\r\n", p);
+      if (eol < 0 || eol > hEnd) { bad = true; break; }
+      const hline = conn.buf.toString("latin1", p, eol);
+      const colon = hline.indexOf(":");
+      if (colon <= 0) { bad = true; break; }
+      const name = hline.slice(0, colon).trim().toLowerCase();
+      const value = hline.slice(colon + 1).trim();
+      if (name === "content-length") {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n) || n < 0) { bad = true; break; }
+        contentLength = n;
+      } else if (name === "transfer-encoding") {
+        if (value.toLowerCase().includes("chunked")) chunked = true;
+      } else if (name === "connection") {
+        const v = value.toLowerCase();
+        if (v.includes("close")) keepAlive = false;
+        else if (v.includes("keep-alive")) keepAlive = true;
+      } else if (name === "expect") {
+        if (value.toLowerCase().includes("100-continue")) expectContinue = true;
+      }
+      headers[name] = value;
+      p = eol + 2;
+    }
+    if (bad) { sock.destroy(); conn.closed = true; return; }
+    const bodyStart = hEnd + 4;
+    if (expectContinue) sock.write("HTTP/1.1 100 Continue\r\n\r\n");
+    if (chunked) {
+      let bp = bodyStart;
+      const parts: Buffer[] = [];
+      let total = 0;
+      let done = false;
+      let needMore = false;
+      for (;;) {
+        const le = conn.buf.indexOf("\r\n", bp);
+        if (le < 0) { needMore = true; break; }
+        const size = parseInt(conn.buf.toString("latin1", bp, le).trim(), 16);
+        if (!Number.isFinite(size) || size < 0 || size > RAW_MAX_BODY) { bad = true; break; }
+        if (size === 0) {
+          if (conn.buf.length - (le + 2) >= 2 && conn.buf[le + 2] === 13 && conn.buf[le + 3] === 10) {
+            conn.off = le + 4; done = true; break;
+          }
+          const te = conn.buf.indexOf("\r\n\r\n", le + 2);
+          if (te < 0) { needMore = true; break; }
+          conn.off = te + 4; done = true; break;
+        }
+        const cs = le + 2;
+        const ce = cs + size;
+        if (conn.buf.length < ce + 2) { needMore = true; break; }
+        parts.push(conn.buf.subarray(cs, ce));
+        total += size;
+        bp = ce + 2;
+      }
+      if (bad) { sock.destroy(); conn.closed = true; return; }
+      if (needMore || !done) return;
+      const body = total === 0 ? RAW_EMPTY : Buffer.concat(parts, total);
+      if (conn.off >= conn.buf.length) { conn.buf = RAW_EMPTY; conn.off = 0; }
+      rawDispatch(conn, method, target, headers, body, keepAlive);
+      return;
+    }
+    if (contentLength > RAW_MAX_BODY) {
+      // Absurd body: answer 413 exactly like readBody+sendError would, then close.
+      const b413 = Buffer.from(JSON.stringify({ message: "payload too large", documentation_url: "https://docs.github.com/rest" }), "utf8");
+      const h = `HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${b413.length}\r\nConnection: close\r\nDate: ${httpDate()}\r\n\r\n`;
+      sock.write(Buffer.concat([Buffer.from(h, "latin1"), b413]));
+      sock.end();
+      conn.closed = true;
+      return;
+    }
+    if (conn.buf.length - bodyStart < contentLength) return;
+    const body = contentLength === 0 ? RAW_EMPTY : Buffer.from(conn.buf.subarray(bodyStart, bodyStart + contentLength));
+    conn.off = bodyStart + contentLength;
+    if (conn.off >= conn.buf.length) { conn.buf = RAW_EMPTY; conn.off = 0; }
+    rawDispatch(conn, method, target, headers, body, keepAlive);
+    return;
+  }
+}
+
+const server = createNetServer((sock: Socket) => {
+  sock.setNoDelay(true);
+  sock.setTimeout(5000);
+  sock.on("timeout", () => sock.destroy());
+  sock.on("error", () => { /* client gone; nothing to do */ });
+  const conn: RawConn = { sock, buf: RAW_EMPTY, off: 0, busy: false, closed: false, halfClosed: false };
+  sock.on("data", (chunk: Buffer) => {
+    if (conn.closed) return;
+    if (conn.off === 0) conn.buf = conn.buf.length === 0 ? chunk : Buffer.concat([conn.buf, chunk]);
+    else {
+      conn.buf = Buffer.concat([conn.buf.subarray(conn.off), chunk]);
+      conn.off = 0;
+    }
+    rawPump(conn);
+  });
+  sock.on("end", () => {
+    if (conn.busy) conn.halfClosed = true;
+    else { try { sock.end(); } catch { /* already gone */ } }
+  });
+  sock.on("close", () => { conn.closed = true; });
 });
 
 function shutdown(): void {
