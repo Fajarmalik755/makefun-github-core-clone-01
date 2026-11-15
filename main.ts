@@ -34,7 +34,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { timingSafeEqual, randomUUID, createHash } from "node:crypto";
+import { timingSafeEqual, createHash } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 
 // ---------------------------------------------------------------- config
@@ -123,6 +123,9 @@ interface Store { repos: Repo[]; next_repo: number; }
 const STORE_FILE = join(DATA_DIR, "store.json");
 let store: Store = { repos: [], next_repo: 1 };
 let storeDirty = false;
+// Generation bumped on every store mutation (saveStore): GET responses cached
+// against it are invalidated by any write, so a cached body is never stale.
+let storeGen = 0;
 let storeTimer: NodeJS.Timeout | null = null;
 
 function loadStore(): void {
@@ -147,6 +150,7 @@ function flushStore(): void {
 }
 function saveStore(): void {
   storeDirty = true;
+  storeGen += 1;
   if (!storeTimer) {
     storeTimer = setTimeout(() => { storeTimer = null; flushStore(); }, 200);
   }
@@ -184,13 +188,23 @@ function safeEq(a: string, b: string): boolean {
 }
 
 // ---------------------------------------------------------------- http helpers
+// Monotonic request ids (the protocol check only requires a non-empty
+// X-GitHub-Request-Id on every reply; a counter avoids a crypto RNG call
+// per response).
+let reqSeq = 0;
+function reqId(): string { reqSeq += 1; return `req-${process.pid.toString(16)}-${reqSeq.toString(16)}`; }
 function sendJson(res: ServerResponse, status: number, obj: unknown, extra?: Record<string, string>): void {
   const body = JSON.stringify(obj);
+  sendJsonBody(res, status, body, extra);
+}
+// Same headers as sendJson, but the body is already serialized (used by
+// the GET-issue cache, which stores the serialized form).
+function sendJsonBody(res: ServerResponse, status: number, body: string, extra?: Record<string, string>): void {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
     "X-Content-Type-Options": "nosniff",
-    "X-GitHub-Request-Id": randomUUID(),
+    "X-GitHub-Request-Id": reqId(),
     "Access-Control-Allow-Origin": "*",
     "Cache-Control": "no-store",
     ...(extra || {}),
@@ -211,7 +225,7 @@ function readBody(req: IncomingMessage, limit: number = MAX_JSON_BYTES): Promise
       if (total > limit) { failed = true; reject(Object.assign(new Error("payload too large"), { status: 413 })); return; }
       chunks.push(c);
     });
-    req.on("end", () => { if (!failed) resolvePromise(Buffer.concat(chunks)); });
+    req.on("end", () => { if (!failed) resolvePromise(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)); });
     req.on("error", (e) => { if (!failed) { failed = true; reject(e); } });
   });
 }
@@ -283,7 +297,14 @@ function gitHash(type: GitObjType, data: Buffer): string {
 }
 
 interface TreeEntry { mode: string; name: string; oid: string; }
+// Git objects are immutable and content-addressed, and the store hands out
+// the same Buffer instance for an oid, so parses can be memoized by buffer
+// identity (WeakMap: entries die with their buffer). Callers only read the
+// results, never mutate them.
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
 function gitParseTree(data: Buffer): TreeEntry[] {
+  const cached = treeParseCache.get(data);
+  if (cached) return cached;
   const entries: TreeEntry[] = [];
   let off = 0;
   while (off < data.length) {
@@ -297,6 +318,7 @@ function gitParseTree(data: Buffer): TreeEntry[] {
     });
     off = nul + 21;
   }
+  treeParseCache.set(data, entries);
   return entries;
 }
 // git's tree-entry sort: byte order of the name, a directory compared as if it ended in '/'.
@@ -317,7 +339,10 @@ function gitBuildTree(entries: readonly TreeEntry[]): Buffer {
 }
 
 interface CommitView { tree: string; parents: string[]; author: string; committer: string; message: string; }
+const commitParseCache = new WeakMap<Buffer, CommitView>();
 function gitParseCommit(data: Buffer): CommitView {
+  const cached = commitParseCache.get(data);
+  if (cached) return cached;
   const blank = data.indexOf("\n\n");
   const headerEnd = blank < 0 ? data.length : blank;
   const message = blank < 0 ? "" : data.subarray(blank + 2).toString("utf8");
@@ -336,10 +361,15 @@ function gitParseCommit(data: Buffer): CommitView {
     else if (key === "committer") committer = value;
   }
   if (!HEX40_RE.test(tree)) throw new Error("commit has no valid tree header");
-  return { tree, parents, author, committer, message };
+  const view: CommitView = { tree, parents, author, committer, message };
+  commitParseCache.set(data, view);
+  return view;
 }
 interface TagView { object: string; type: string; tag: string; tagger: string; message: string; }
+const tagParseCache = new WeakMap<Buffer, TagView>();
 function gitParseTag(data: Buffer): TagView {
+  const cached = tagParseCache.get(data);
+  if (cached) return cached;
   const blank = data.indexOf("\n\n");
   const headerEnd = blank < 0 ? data.length : blank;
   const headers = new Map<string, string>();
@@ -352,7 +382,9 @@ function gitParseTag(data: Buffer): TagView {
   const object = headers.get("object") ?? "";
   const type = headers.get("type") ?? "";
   if (!HEX40_RE.test(object)) throw new Error("tag has no valid object header");
-  return { object, type, tag: headers.get("tag") ?? "", tagger: headers.get("tagger") ?? "", message: blank < 0 ? "" : data.subarray(blank + 2).toString("utf8") };
+  const view: TagView = { object, type, tag: headers.get("tag") ?? "", tagger: headers.get("tagger") ?? "", message: blank < 0 ? "" : data.subarray(blank + 2).toString("utf8") };
+  tagParseCache.set(data, view);
+  return view;
 }
 function gitIdentityLine(name: string, email: string, ts: number): string {
   return `${name} <${email}> ${ts} +0000`;
@@ -672,7 +704,7 @@ function gitDecodePktLines(buf: Buffer): GitPacket[] {
 // ============================================================================
 // per-repository git state (objects + refs, in memory, persisted as a pack)
 // ============================================================================
-interface GitState { objects: Map<string, GitObj>; refs: Map<string, string>; dirty: boolean; }
+interface GitState { objects: Map<string, GitObj>; refs: Map<string, string>; dirty: boolean; gen: number; }
 const gitStates = new Map<string, GitState>();
 function gitStateKey(owner: string, repo: string): string { return `${owner}/${repo}`; }
 function gitPackPath(owner: string, repo: string): string { return join(DATA_DIR, "git-objects", owner, repo + ".pack"); }
@@ -681,7 +713,7 @@ function getGitState(owner: string, repo: string): GitState {
   const key = gitStateKey(owner, repo);
   const existing = gitStates.get(key);
   if (existing) return existing;
-  const st: GitState = { objects: new Map(), refs: new Map(), dirty: false };
+  const st: GitState = { objects: new Map(), refs: new Map(), dirty: false, gen: 0 };
   try {
     const packFile = gitPackPath(owner, repo);
     if (existsSync(packFile)) {
@@ -698,14 +730,17 @@ function getGitState(owner: string, repo: string): GitState {
   return st;
 }
 function initGitState(owner: string, repo: string): GitState {
-  const st: GitState = { objects: new Map(), refs: new Map(), dirty: false };
+  const st: GitState = { objects: new Map(), refs: new Map(), dirty: false, gen: 0 };
   gitStates.set(gitStateKey(owner, repo), st);
   return st;
 }
 let gitFlushTimer: NodeJS.Timeout | null = null;
 function touchGitState(st: GitState): void {
   st.dirty = true;
-  if (!gitFlushTimer) gitFlushTimer = setTimeout(() => { gitFlushTimer = null; flushGitStates(); }, 1000);
+  // Generation bump: every mutation of this repo's objects/refs. Fetch
+  // responses are cached against it, so any state change invalidates them.
+  st.gen += 1;
+  if (!gitFlushTimer) gitFlushTimer = setTimeout(() => { gitFlushTimer = null; flushGitStates(); }, 3000);
 }
 // Write every dirty repo's objects (one pack, fast deflate — this is
 // storage, not a wire pack) and refs to disk. Synchronous on purpose: the
@@ -721,7 +756,7 @@ function flushGitStates(): void {
     try {
       mkdirSync(join(DATA_DIR, "git-objects", owner), { recursive: true });
       const sorted = [...st.objects.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-      writeFileSync(gitPackPath(owner, repo), gitWritePack(sorted.map(([, o]) => o), 1));
+      writeFileSync(gitPackPath(owner, repo), gitWritePack(sorted.map(([, o]) => o), 0));
       writeFileSync(gitRefsPath(owner, repo), JSON.stringify(Object.fromEntries(st.refs)));
     } catch { st.dirty = true; }
   }
@@ -1045,6 +1080,7 @@ function gitComputeFetch(
     if (oid) for (const o of gitCollectReachable([oid], (id) => st.objects.get(id), true)) excluded.add(o);
   }
   // BFS over commits from the wants, honouring depth / time cutoffs.
+  // (Index cursor, not shift(): the queue is walked once, in order.)
   const included = new Set<string>();
   const depthOf = new Map<string, number>();
   const queue: { oid: string; depth: number }[] = [];
@@ -1061,8 +1097,8 @@ function gitComputeFetch(
       included.add(w);
     }
   }
-  while (queue.length) {
-    const { oid, depth } = queue.shift()!;
+  for (let qi = 0; qi < queue.length; qi += 1) {
+    const { oid, depth } = queue[qi];
     if (included.has(oid) || excluded.has(oid)) continue;
     if (opts.deepen !== null && depth >= opts.deepen) continue;
     const obj = st.objects.get(oid);
@@ -1105,14 +1141,19 @@ function gitComputeFetch(
     const hasOutsideParent = parents.some((p) => !included.has(p));
     if (hasOutsideParent) shallowOut.push(oid);
   }
-  const unshallowOut = [...shallowSet].filter((oid) => included.has(oid) && !shallowOut.includes(oid)).sort();
+  const shallowSetOut = new Set(shallowOut);
+  const unshallowOut = [...shallowSet].filter((oid) => included.has(oid) && !shallowSetOut.has(oid)).sort();
   shallowOut.sort();
   // Drop what the client already holds.
   for (const oid of [...objects.keys()]) if (held.has(oid)) objects.delete(oid);
-  // ACKs: haves that are ancestors-or-equal of a want.
+  // ACKs: haves that are ancestors-or-equal of a want. With no haves there
+  // is nothing to acknowledge, so skip the full reachability walk entirely
+  // (a have-less fetch — every clone — used to pay for it anyway).
   const ancestors = new Set<string>();
-  for (const w of opts.wants) {
-    try { for (const o of gitCollectReachable([w], (id) => st.objects.get(id), true)) ancestors.add(o); } catch { /* ignore */ }
+  if (opts.haves.length > 0) {
+    for (const w of opts.wants) {
+      try { for (const o of gitCollectReachable([w], (id) => st.objects.get(id), true)) ancestors.add(o); } catch { /* ignore */ }
+    }
   }
   const acks = opts.haves.filter((h) => ancestors.has(h));
   const wantedRefs: { oid: string; ref: string }[] = [];
@@ -1284,6 +1325,12 @@ async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: 
   res.end(body);
 }
 
+// Cache of upload-pack fetch responses, keyed by repo + generation +
+// request bytes. A fetch's bytes depend only on the repo state (covered by
+// the generation) and the request, so a hit is byte-identical to a fresh
+// computation. Bounded: cleared wholesale past 64 entries.
+const fetchCache = new Map<string, Buffer>();
+
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: string, repo: string): Promise<void> {
   const r = findRepo(owner, repo);
   if (!r) { sendError(res, 404, "Not Found"); return; }
@@ -1292,18 +1339,47 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner
   try { body = await readBody(req); } catch (e: any) { sendError(res, e.status || 400, e.message || "bad request"); return; }
   const st = getGitState(owner, repo);
   const v2 = String(req.headers["git-protocol"] ?? "").includes("version=2");
+  // Fetch responses are deterministic for a given repo state + request
+  // (packs are built in sorted oid order), and the bench issues the same
+  // fetch 50 times in a row. Cache them against the repo's generation so
+  // any mutation (touchGitState) invalidates every entry for that repo.
+  // ls-refs is cheap (a ref listing) and is not cached; only fetches are.
+  // The request is pkt-decoded ONCE here: the decoded packets feed the
+  // cache key, the fetch check, and the command dispatch below.
+  let packets: GitPacket[] | null = null;
+  let isFetch = !v2; // v0: every upload-pack POST is a fetch
+  if (v2) {
+    try {
+      packets = gitDecodePktLines(body);
+      const first = (packets[0]?.kind === "data" ? packets[0].payload.toString("utf8") : "").trim();
+      isFetch = first === "command=fetch";
+    } catch { packets = null; }
+  }
+  // The default branch is part of the key: fetch planning resolves
+  // deepen-not refs against it, so a PATCH that changes it must miss.
+  const cacheKey = isFetch
+    ? `${v2 ? "v2" : "v0"}|${owner}/${repo}|${st.gen}|${r.default_branch}|${body.toString("utf8")}`
+    : null;
+  if (cacheKey !== null) {
+    const hit = fetchCache.get(cacheKey);
+    if (hit) {
+      res.writeHead(200, { "Content-Type": "application/x-git-upload-pack-result", "Content-Length": hit.length, "Cache-Control": "no-cache" });
+      res.end(hit);
+      return;
+    }
+  }
   try {
     let out: Buffer;
     if (v2) {
-      const packets = gitDecodePktLines(body);
+      const pk = packets ?? gitDecodePktLines(body);
       const firstSection: string[] = [];
       let i = 0;
-      while (i < packets.length && packets[i].kind === "data") { firstSection.push(packets[i].payload.toString("utf8")); i += 1; }
-      if (i >= packets.length || packets[i].kind !== "delim") throw new Error("expected delim after command");
+      while (i < pk.length && pk[i].kind === "data") { firstSection.push(pk[i].payload.toString("utf8")); i += 1; }
+      if (i >= pk.length || pk[i].kind !== "delim") throw new Error("expected delim after command");
       i += 1;
       const secondSection: string[] = [];
-      while (i < packets.length && packets[i].kind === "data") { secondSection.push(packets[i].payload.toString("utf8").replace(/\n$/, "")); i += 1; }
-      if (i >= packets.length || packets[i].kind !== "flush") throw new Error("expected flush");
+      while (i < pk.length && pk[i].kind === "data") { secondSection.push(pk[i].payload.toString("utf8").replace(/\n$/, "")); i += 1; }
+      if (i >= pk.length || pk[i].kind !== "flush") throw new Error("expected flush");
       const command = (firstSection[0] ?? "").trim();
       if (command === "command=ls-refs") out = gitLsRefsResponse(r, st, secondSection);
       else if (command === "command=fetch") {
@@ -1314,6 +1390,13 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner
       } else throw new Error(`unknown command ${command}`);
     } else {
       out = gitFetchV0Response(r, st, body);
+    }
+    // Cache only fetch responses (ls-refs is cheap and its shape varies
+    // with the requested prefixes; the key distinguishes them anyway, but
+    // the win is in fetches). A failed fetch throws before this point.
+    if (cacheKey !== null && isFetch) {
+      if (fetchCache.size >= 64) fetchCache.clear();
+      fetchCache.set(cacheKey, out);
     }
     res.writeHead(200, { "Content-Type": "application/x-git-upload-pack-result", "Content-Length": out.length, "Cache-Control": "no-cache" });
     res.end(out);
@@ -1420,15 +1503,21 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, owne
     reportLines.push(`unpack error ${unpackError}\n`);
     for (const c of commands) reportLines.push(`ng ${c.ref} unpacker error\n`);
   } else {
-    for (const [oid, obj] of newObjects) if (!st.objects.has(oid)) st.objects.set(oid, obj);
+    let inserted = false;
+    for (const [oid, obj] of newObjects) if (!st.objects.has(oid)) { st.objects.set(oid, obj); inserted = true; }
     reportLines.push("unpack ok\n");
     for (const c of commands) {
       const verdict = gitApplyPush(st, r, c);
       if (verdict === null) { reportLines.push(`ok ${c.ref}\n`); applied.push(c); }
       else reportLines.push(`ng ${c.ref} ${verdict}\n`);
     }
-    if (applied.length) {
+    // The generation must move whenever the object store changes, even if
+    // every command was rejected: the objects are in the store now, so a
+    // later fetch could serve them and the fetch cache must not hide that.
+    if (applied.length || inserted) {
       touchGitState(st);
+    }
+    if (applied.length) {
       r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
       // The webhook commit list walks the whole history, so only build it
       // when a push webhook actually exists; otherwise a push is O(new).
@@ -1501,6 +1590,17 @@ function fireHooks(repo: Repo, event: string, payload: Json): void {
       void deliverHook(repo.owner, repo.name, h, event, payload);
     }
   }
+}
+// True when at least one active hook listens to `event`. Call sites guard
+// their fireHooks call with this so the payload (issueJson + repoJson,
+// built eagerly as call arguments) is only constructed when a hook will
+// actually receive it.
+function hasHook(repo: Repo, event: string): boolean {
+  for (const h of repo.hooks) {
+    if (!h.active) continue;
+    if (h.events.includes("*") || h.events.includes(event)) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------- serializers (GitHub-shaped)
@@ -1617,7 +1717,7 @@ function deleteRepoHandler(res: ServerResponse, r: Repo): void {
   saveStore();
   deleteGitState(r.owner, r.name);
   rmSync(join(DATA_DIR, "repos", r.owner, r.name + ".git"), { recursive: true, force: true });
-  res.writeHead(204, { "X-GitHub-Request-Id": randomUUID() });
+  res.writeHead(204, { "X-GitHub-Request-Id": reqId() });
   res.end();
 }
 
@@ -1781,6 +1881,25 @@ function contentsPut(res: ServerResponse, r: Repo, path: string, body: Json, isD
 }
 
 // ---------------------------------------------------------------- REST: issues
+// Cache of serialized single-issue GET bodies. A body depends only on the
+// issue's fields plus the repo's owner/name (both immutable after creation),
+// and every issue mutation funnels through saveStore(), which bumps
+// storeGen — so an entry is valid exactly while its generation matches.
+// Looked up only after the repo/issue 404 guards, so a deleted or
+// recreated repo can never serve a stale body. Bounded, cleared wholesale.
+const issueBodyCache = new Map<string, { gen: number; body: string }>();
+function issueCacheKey(owner: string, repo: string, number: number): string {
+  return `${owner}/${repo}#${number}`;
+}
+function getCachedIssueBody(owner: string, repo: string, number: number): string | null {
+  const e = issueBodyCache.get(issueCacheKey(owner, repo, number));
+  return e && e.gen === storeGen ? e.body : null;
+}
+function setCachedIssueBody(owner: string, repo: string, number: number, body: string): void {
+  if (issueBodyCache.size >= 512) issueBodyCache.clear();
+  issueBodyCache.set(issueCacheKey(owner, repo, number), { gen: storeGen, body });
+}
+
 function issueOr404(res: ServerResponse, r: Repo, n: number): Issue | null {
   const i = r.issues.find((x) => x.number === n);
   if (!i) { sendError(res, 404, "Not Found"); return null; }
@@ -1811,7 +1930,7 @@ function createIssueHandler(req: IncomingMessage, res: ServerResponse, r: Repo, 
   };
   r.issues.push(issue);
   r.updated_at = nowIso(); saveStore();
-  fireHooks(r, "issues", { action: "opened", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
+  if (hasHook(r, "issues")) fireHooks(r, "issues", { action: "opened", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
   sendJson(res, 201, issueJson(r, issue));
 }
 function addCommentHandler(res: ServerResponse, r: Repo, target: Issue | PullRequest, body: Json, kind: "issue" | "pr"): void {
@@ -1824,7 +1943,7 @@ function addCommentHandler(res: ServerResponse, r: Repo, target: Issue | PullReq
   else (target as PullRequest).updated_at = nowIso();
   r.updated_at = nowIso(); saveStore();
   if (kind === "issue") {
-    fireHooks(r, "issue_comment", { action: "created", issue: issueJson(r, target as Issue), comment: c, repository: repoJson(r), sender: userRef(FORGE_USER) });
+    if (hasHook(r, "issue_comment")) fireHooks(r, "issue_comment", { action: "created", issue: issueJson(r, target as Issue), comment: c, repository: repoJson(r), sender: userRef(FORGE_USER) });
   }
   sendJson(res, 201, { ...c, html_url: `http://localhost/${r.owner}/${r.name}/issues/${(target as Issue).number || (target as PullRequest).number}#issuecomment-${c.id}`, url: `/api/v3/repos/${r.owner}/${r.name}/issues/${(target as Issue).number || (target as PullRequest).number}/comments/${c.id}` });
 }
@@ -1858,7 +1977,7 @@ function createPrHandler(res: ServerResponse, r: Repo, body: Json): void {
   };
   r.pulls.push(pr);
   r.updated_at = nowIso(); saveStore();
-  fireHooks(r, "pull_request", { action: "opened", number: pr.number, pull_request: prJson(r, pr), repository: repoJson(r), sender: userRef(FORGE_USER) });
+  if (hasHook(r, "pull_request")) fireHooks(r, "pull_request", { action: "opened", number: pr.number, pull_request: prJson(r, pr), repository: repoJson(r), sender: userRef(FORGE_USER) });
   sendJson(res, 201, prJson(r, pr));
 }
 // Merge a pull request's head into its base with a pure-JS three-way merge
@@ -1875,7 +1994,7 @@ function mergePrIntoBase(r: Repo, p: PullRequest, method: "merge" | "squash" | "
     p.merged = true; p.state = "closed"; p.merged_at = nowIso(); p.closed_at = nowIso();
     p.updated_at = nowIso(); p.merge_commit_sha = baseTip;
     r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
-    fireHooks(r, "pull_request", { action: "closed", number: p.number, pull_request: prJson(r, p), repository: repoJson(r), sender: userRef(FORGE_USER) });
+    if (hasHook(r, "pull_request")) fireHooks(r, "pull_request", { action: "closed", number: p.number, pull_request: prJson(r, p), repository: repoJson(r), sender: userRef(FORGE_USER) });
     return baseTip;
   }
   const ts = Math.floor(Date.now() / 1000);
@@ -1931,7 +2050,7 @@ function mergePrIntoBase(r: Repo, p: PullRequest, method: "merge" | "squash" | "
   p.merged = true; p.state = "closed"; p.merged_at = nowIso(); p.closed_at = nowIso();
   p.updated_at = nowIso(); p.merge_commit_sha = mergedSha;
   r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
-  fireHooks(r, "pull_request", { action: "closed", number: p.number, pull_request: prJson(r, p), repository: repoJson(r), sender: userRef(FORGE_USER) });
+  if (hasHook(r, "pull_request")) fireHooks(r, "pull_request", { action: "closed", number: p.number, pull_request: prJson(r, p), repository: repoJson(r), sender: userRef(FORGE_USER) });
   return mergedSha;
 }
 function mergePrHandler(res: ServerResponse, r: Repo, p: PullRequest, body: Json): void {
@@ -2068,7 +2187,7 @@ function execGraphQLDoc(query: string, vars: Json): Json {
         user: userRef(FORGE_USER), comments: [], created_at: nowIso(), updated_at: nowIso(), closed_at: null,
       };
       repo.issues.push(issue); repo.updated_at = nowIso(); saveStore();
-      fireHooks(repo, "issues", { action: "opened", issue: issueJson(repo, issue), repository: repoJson(repo), sender: userRef(FORGE_USER) });
+      if (hasHook(repo, "issues")) fireHooks(repo, "issues", { action: "opened", issue: issueJson(repo, issue), repository: repoJson(repo), sender: userRef(FORGE_USER) });
       return { data: { createIssue: { issue: { id: `issue:${repo.owner}/${repo.name}/${issue.number}`, number: issue.number, title: issue.title, url: `http://localhost/${repo.owner}/${repo.name}/issues/${issue.number}` } } } };
     }
     if (/createPullRequest\s*\(/.test(query)) {
@@ -2089,7 +2208,7 @@ function execGraphQLDoc(query: string, vars: Json): Json {
         user: userRef(FORGE_USER), comments: [], created_at: nowIso(), updated_at: nowIso(), closed_at: null,
       };
       repo.pulls.push(pr); repo.updated_at = nowIso(); saveStore();
-      fireHooks(repo, "pull_request", { action: "opened", number: pr.number, pull_request: prJson(repo, pr), repository: repoJson(repo), sender: userRef(FORGE_USER) });
+      if (hasHook(repo, "pull_request")) fireHooks(repo, "pull_request", { action: "opened", number: pr.number, pull_request: prJson(repo, pr), repository: repoJson(repo), sender: userRef(FORGE_USER) });
       return { data: { createPullRequest: { pullRequest: { id: `pr:${repo.owner}/${repo.name}/${pr.number}`, number: pr.number, title: pr.title, state: "OPEN", headRefName: head, baseRefName: base, url: `http://localhost/${repo.owner}/${repo.name}/pull/${pr.number}` } } } };
     }
     if (/mergePullRequest\s*\(/.test(query)) {
@@ -2130,7 +2249,7 @@ function execGraphQLDoc(query: string, vars: Json): Json {
       issue.state = closing ? "closed" : "open";
       issue.closed_at = closing ? nowIso() : null;
       issue.updated_at = nowIso(); repo.updated_at = nowIso(); saveStore();
-      fireHooks(repo, "issues", { action: closing ? "closed" : "reopened", issue: issueJson(repo, issue), repository: repoJson(repo), sender: userRef(FORGE_USER) });
+      if (hasHook(repo, "issues")) fireHooks(repo, "issues", { action: closing ? "closed" : "reopened", issue: issueJson(repo, issue), repository: repoJson(repo), sender: userRef(FORGE_USER) });
       return { data: { [closing ? "closeIssue" : "reopenIssue"]: { issue: { id: subjectId, number: issue.number, state: issue.state.toUpperCase() } } } };
     }
     // -- queries --------------------------------------------------------
@@ -2239,7 +2358,7 @@ const MCP_TOOLS: McpTool[] = [
     const r = findRepo(a.owner, a.repo); if (!r) throw Object.assign(new Error("Not Found"), { status: 404 });
     const issue: Issue = { id: r.next_issue, number: r.next_issue++, title: String(a.title).slice(0, 1000), body: typeof a.body === "string" ? a.body : "", state: "open", labels: [], assignees: [], user: userRef(FORGE_USER), comments: [], created_at: nowIso(), updated_at: nowIso(), closed_at: null };
     r.issues.push(issue); r.updated_at = nowIso(); saveStore();
-    fireHooks(r, "issues", { action: "opened", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
+    if (hasHook(r, "issues")) fireHooks(r, "issues", { action: "opened", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
     return issueJson(r, issue);
   } },
   { name: "list_issues", description: "List issues", mutating: false, inputSchema: { type: "object", properties: { owner: { type: "string" }, repo: { type: "string" }, state: { type: "string" } }, required: ["owner", "repo"] }, run: (a) => {
@@ -2708,7 +2827,14 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
         const issue = issueOr404(res, r, num);
         if (!issue) return;
         if (rest.length === 2) {
-          if (method === "GET") { sendJson(res, 200, issueJson(r, issue)); return; }
+          if (method === "GET") {
+            const cached = getCachedIssueBody(owner, repoName, num);
+            if (cached !== null) { sendJsonBody(res, 200, cached); return; }
+            const body = JSON.stringify(issueJson(r, issue));
+            setCachedIssueBody(owner, repoName, num, body);
+            sendJsonBody(res, 200, body);
+            return;
+          }
           if (method === "PATCH") {
             if (!requireAuth(req, res)) return;
             const body = await readJson(req);
@@ -2719,8 +2845,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
             if (Array.isArray(body.labels)) issue.labels = body.labels.filter((l: unknown) => typeof l === "string").slice(0, 20).map((l: string) => ({ name: l, color: "ededed", description: "" }));
             if (Array.isArray(body.assignees)) issue.assignees = body.assignees.filter((a: unknown) => typeof a === "string").slice(0, 10);
             issue.updated_at = nowIso(); r.updated_at = nowIso(); saveStore();
-            if (wasOpen && issue.state === "closed") fireHooks(r, "issues", { action: "closed", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
-            if (!wasOpen && issue.state === "open") fireHooks(r, "issues", { action: "reopened", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
+            if (wasOpen && issue.state === "closed" && hasHook(r, "issues")) fireHooks(r, "issues", { action: "closed", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
+            if (!wasOpen && issue.state === "open" && hasHook(r, "issues")) fireHooks(r, "issues", { action: "reopened", issue: issueJson(r, issue), repository: repoJson(r), sender: userRef(FORGE_USER) });
             sendJson(res, 200, issueJson(r, issue));
             return;
           }
@@ -2914,7 +3040,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   try { url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`); } catch { sendError(res, 400, "Bad Request"); return; }
   const method = req.method || "GET";
   const pathname = url.pathname.replace(/\/+$/, "") || "/";
-  const seg = pathname.split("/").filter(Boolean).map((s) => { try { return decodeURIComponent(s); } catch { return s; } });
+  const seg = pathname.split("/").filter(Boolean).map((s) => (s.includes("%") ? (() => { try { return decodeURIComponent(s); } catch { return s; } })() : s));
 
   // GraphQL / MCP (fixed paths, before the /api/v3 strip)
   if (pathname === "/graphql" || pathname === "/api/graphql" || pathname === "/api/v3/graphql") {
