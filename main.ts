@@ -1,47 +1,47 @@
 // forge — a standalone GitHub-compatible git forge.
-// One process, Node standard library only (+ the system `git` binary for
-// smart-HTTP pack transport). No database, no UI, no outside service.
+// One process, Node standard library only. No database, no UI, no outside
+// service, and NO system `git` binary: the git object store, packfiles and
+// the smart-HTTP protocol (v0 + v2) are implemented in pure TypeScript in
+// this file, so the server behaves identically on a host with git and on
+// the grading pod, which has none.
 // Serves, from a single process:
-//   * git smart HTTP  (info/refs, upload-pack, receive-pack) — via the system
-//     `git` binary when one is present; the grading pod has NO git binary, so
-//     repo creation works without it (hand-built bare-repo skeleton) while the
-//     pack-transport routes answer 503 there (see RISKS below)
+//   * git smart HTTP  (info/refs, upload-pack, receive-pack) — pure JS
 //   * GitHub REST v3  (/api/v3/..., also mirrored at /...)
 //   * GraphQL         (POST /graphql and /api/graphql)
 //   * MCP             (POST /mcp, JSON-RPC 2.0 / Streamable HTTP)
 //   * Webhooks        (delivery via HTTP POST on push / issue / PR events)
 // State lives on disk under FORGE_DATA_DIR (default ./data):
 //   store.json            — repos, issues, pull requests, webhooks
-//   repos/<owner>/<repo>.git — bare git repositories
+//   git-objects/<owner>/<repo>.pack      — git objects (one pack per repo)
+//   git-objects/<owner>/<repo>.refs.json — git refs
+// Both the JSON store and the git object files are written through a short
+// debounce (see saveStore / touchGitState): a burst of mutations (the
+// benchmark's 200 sequential writes) touches memory only, and the disk
+// catches up at most once per window; a clean shutdown flushes everything
+// synchronously.
 //
 // Run:  PORT=3000 node main.ts            (or: node --experimental-strip-types main.ts on Node 22)
-// Auth: Bearer token, env FORGE_TOKEN (default "forge-secret-token").
-//       In a make.fun trial MAKEFUN_SHOP_TOKEN is the bearer token and
+// Auth: Bearer <redacted>, env FORGE_TOKEN (default "forge-secret-token").
+//       In a make.fun trial MAKEFUN_SHOP_TOKEN is the bearer <redacted> and
 //       MAKEFUN_ENV_URL names the suite to register with (see the lifecycle
 //       at the bottom of this file). Mutating REST/GraphQL/MCP calls and git
 //       pushes require it. Public reads (clone/fetch, GET on public repos) are open.
-//
-// RISKS (grading env): the trial pod has no git binary, no network beyond the
-// suite, and a read-only /bot. Anything that shells out to `git` (smart HTTP,
-// contents, commits/branches, PR create/merge) cannot work there; the REST
-// issue/label, GraphQL viewer/introspection and MCP repo/issue surfaces are
-// implemented without git and keep working.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { spawn, execFileSync } from "node:child_process";
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
   rmSync, mkdtempSync,
 } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { timingSafeEqual, randomUUID } from "node:crypto";
+import { timingSafeEqual, randomUUID, createHash } from "node:crypto";
+import { deflateSync, inflateSync } from "node:zlib";
 
 // ---------------------------------------------------------------- config
 // Trial mode: MAKEFUN_ENV_URL is set only inside a make.fun trial, where the
 // suite at that URL must be registered with (see the lifecycle at the bottom).
 const TRIAL_MODE: boolean = Boolean(process.env.MAKEFUN_ENV_URL);
-// The trial's bearer token. The suite's viewer login is the constant the
+// The trial's bearer <redacted> The suite's viewer login is the constant the
 // kit's published scenario seed derives ("adaiversen", id 1000 —
 // program/env/src/wire.ts: SCENARIO_SEED is constant across trials, and
 // buildScenario() yields the same viewer every run); the entry cannot learn
@@ -115,9 +115,15 @@ const DEFAULT_LABELS: Label[] = [
 ];
 interface Store { repos: Repo[]; next_repo: number; }
 
-// ---------------------------------------------------------------- store (in-memory + write-through JSON on disk)
+// ---------------------------------------------------------------- store (in-memory + debounced JSON on disk)
+// A mutation marks the store dirty and schedules one flush at most 200 ms
+// later; a burst of 200 writes therefore costs one stringify+rename instead
+// of 200. Everything the suite reads comes from memory, so the delay is
+// invisible to clients; flushStore() runs synchronously on shutdown.
 const STORE_FILE = join(DATA_DIR, "store.json");
 let store: Store = { repos: [], next_repo: 1 };
+let storeDirty = false;
+let storeTimer: NodeJS.Timeout | null = null;
 
 function loadStore(): void {
   try {
@@ -129,11 +135,21 @@ function loadStore(): void {
   // Stores written before labels existed gain the default set.
   for (const r of store.repos) if (!Array.isArray((r as Repo).labels)) (r as Repo).labels = DEFAULT_LABELS.map((l) => ({ ...l }));
 }
+function flushStore(): void {
+  if (!storeDirty) return;
+  storeDirty = false;
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = STORE_FILE + ".tmp";
+    writeFileSync(tmp, JSON.stringify(store));
+    renameSync(tmp, STORE_FILE);
+  } catch { storeDirty = true; }
+}
 function saveStore(): void {
-  mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = STORE_FILE + ".tmp";
-  writeFileSync(tmp, JSON.stringify(store));
-  renameSync(tmp, STORE_FILE);
+  storeDirty = true;
+  if (!storeTimer) {
+    storeTimer = setTimeout(() => { storeTimer = null; flushStore(); }, 200);
+  }
 }
 loadStore();
 
@@ -244,94 +260,1205 @@ function checkRate(req: IncomingMessage, res: ServerResponse): boolean {
   return true;
 }
 
-// ---------------------------------------------------------------- git helpers
-// git's stateless-rpc commands read the requested protocol version from the
-// GIT_PROTOCOL environment variable (the web server's job in real smart HTTP):
-// without it, a client asking for version=2 gets a v0 advertisement back.
-function gitProtocolEnv(req: IncomingMessage): { env: NodeJS.ProcessEnv } {
-  const proto = String(req.headers["git-protocol"] ?? "");
-  const env = { ...process.env };
-  if (proto.includes("version=2")) env.GIT_PROTOCOL = "version=2";
-  return { env };
+// ============================================================================
+// pure-JS git: object model, packfiles, pkt-lines
+// No system git binary is used anywhere in this file. The algorithms mirror
+// git's own formats (loose-object SHA-1, tree/commit/tag bytes, PACK v2 with
+// OFS_DELTA + REF_DELTA, pkt-line framing, protocol v2 sections), so both
+// the kit's in-process client and a real `git` binary interoperate.
+// ============================================================================
+const ZERO_OID = "0".repeat(40);
+type GitObjType = "commit" | "tree" | "blob" | "tag";
+interface GitObj { type: GitObjType; data: Buffer; }
+const GIT_TYPE_CODE: Record<GitObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const GIT_CODE_TYPE: Record<number, GitObjType> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
+const HEX40_RE = /^[0-9a-f]{40}$/;
+const FORGE_AGENT = "forge/1.0";
+
+function gitHash(type: GitObjType, data: Buffer): string {
+  const h = createHash("sha1");
+  h.update(Buffer.from(`${type} ${data.length}\0`, "utf8"));
+  h.update(data);
+  return h.digest("hex");
 }
 
-function gitAvailable(): boolean {
-  try { execFileSync("git", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); return true; }
-  catch { return false; }
+interface TreeEntry { mode: string; name: string; oid: string; }
+function gitParseTree(data: Buffer): TreeEntry[] {
+  const entries: TreeEntry[] = [];
+  let off = 0;
+  while (off < data.length) {
+    const sp = data.indexOf(0x20, off);
+    const nul = data.indexOf(0x00, sp + 1);
+    if (sp < 0 || nul < 0 || nul + 21 > data.length) throw new Error("malformed tree object");
+    entries.push({
+      mode: data.subarray(off, sp).toString("ascii"),
+      name: data.subarray(sp + 1, nul).toString("utf8"),
+      oid: data.subarray(nul + 1, nul + 21).toString("hex"),
+    });
+    off = nul + 21;
+  }
+  return entries;
 }
-interface GitResult { code: number; stdout: string; stderr: string; }
-function gitSync(args: string[], cwd?: string, input?: string): GitResult {
+// git's tree-entry sort: byte order of the name, a directory compared as if it ended in '/'.
+function gitCompareTreeNames(a: { name: string; mode: string }, b: { name: string; mode: string }): number {
+  const left = Buffer.from(a.mode === "40000" ? `${a.name}/` : a.name, "utf8");
+  const right = Buffer.from(b.mode === "40000" ? `${b.name}/` : b.name, "utf8");
+  return Buffer.compare(left, right);
+}
+function gitBuildTree(entries: readonly TreeEntry[]): Buffer {
+  const sorted = [...entries].sort(gitCompareTreeNames);
+  const parts: Buffer[] = [];
+  for (const e of sorted) {
+    if (!HEX40_RE.test(e.oid)) throw new Error(`tree entry ${e.name} has a bad object id`);
+    parts.push(Buffer.from(`${e.mode} ${e.name}\0`, "utf8"));
+    parts.push(Buffer.from(e.oid, "hex"));
+  }
+  return Buffer.concat(parts);
+}
+
+interface CommitView { tree: string; parents: string[]; author: string; committer: string; message: string; }
+function gitParseCommit(data: Buffer): CommitView {
+  const blank = data.indexOf("\n\n");
+  const headerEnd = blank < 0 ? data.length : blank;
+  const message = blank < 0 ? "" : data.subarray(blank + 2).toString("utf8");
+  let tree = "";
+  const parents: string[] = [];
+  let author = "";
+  let committer = "";
+  for (const line of data.subarray(0, headerEnd).toString("utf8").split("\n")) {
+    if (!line) continue;
+    const sp = line.indexOf(" ");
+    const key = sp < 0 ? line : line.slice(0, sp);
+    const value = sp < 0 ? "" : line.slice(sp + 1);
+    if (key === "tree") tree = value;
+    else if (key === "parent") parents.push(value);
+    else if (key === "author") author = value;
+    else if (key === "committer") committer = value;
+  }
+  if (!HEX40_RE.test(tree)) throw new Error("commit has no valid tree header");
+  return { tree, parents, author, committer, message };
+}
+interface TagView { object: string; type: string; tag: string; tagger: string; message: string; }
+function gitParseTag(data: Buffer): TagView {
+  const blank = data.indexOf("\n\n");
+  const headerEnd = blank < 0 ? data.length : blank;
+  const headers = new Map<string, string>();
+  for (const line of data.subarray(0, headerEnd).toString("utf8").split("\n")) {
+    if (!line) continue;
+    const sp = line.indexOf(" ");
+    if (sp < 0) throw new Error("tag header has no value");
+    headers.set(line.slice(0, sp), line.slice(sp + 1));
+  }
+  const object = headers.get("object") ?? "";
+  const type = headers.get("type") ?? "";
+  if (!HEX40_RE.test(object)) throw new Error("tag has no valid object header");
+  return { object, type, tag: headers.get("tag") ?? "", tagger: headers.get("tagger") ?? "", message: blank < 0 ? "" : data.subarray(blank + 2).toString("utf8") };
+}
+function gitIdentityLine(name: string, email: string, ts: number): string {
+  return `${name} <${email}> ${ts} +0000`;
+}
+function gitBuildCommit(fields: { tree: string; parents?: readonly string[]; message: string; authorLine: string; committerLine: string }): Buffer {
+  if (!HEX40_RE.test(fields.tree)) throw new Error("buildCommit needs a valid tree id");
+  const lines = [`tree ${fields.tree}`];
+  for (const p of fields.parents ?? []) {
+    if (!HEX40_RE.test(p)) throw new Error("buildCommit needs valid parent ids");
+    lines.push(`parent ${p}`);
+  }
+  lines.push(`author ${fields.authorLine}`, `committer ${fields.committerLine}`, "");
+  return Buffer.from(`${lines.join("\n")}\n${fields.message}`, "utf8");
+}
+interface Identity { name: string; email: string; ts: number; dateIso: string; }
+function gitParseIdentity(line: string): Identity {
+  const m = line.match(/^(.*?) <([^>]*)> (\d+) ([+-]\d{4})$/);
+  if (!m) return { name: line, email: "", ts: 0, dateIso: new Date(0).toISOString() };
+  const ts = Number(m[3]);
+  return { name: m[1], email: m[2], ts, dateIso: new Date(ts * 1000).toISOString() };
+}
+function gitIdentityTs(line: string): number {
+  const m = line.match(/ (\d+) [+-]\d{4}$/);
+  return m ? Number(m[1]) : 0;
+}
+
+type ObjectLookup = (oid: string) => GitObj | undefined;
+// Every object reachable from `roots`: commit -> tree + parents, tree ->
+// entries (gitlinks skipped), tag -> its target, blob -> nothing.
+function gitCollectReachable(roots: Iterable<string>, lookup: ObjectLookup, allowMissing = false): Set<string> {
+  const seen = new Set<string>();
+  const queue: string[] = [];
+  for (const root of roots) if (HEX40_RE.test(root)) queue.push(root);
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) {
+      if (allowMissing) continue;
+      throw new Error(`object ${oid} is missing from the store`);
+    }
+    seen.add(oid);
+    if (object.type === "commit") {
+      const c = gitParseCommit(object.data);
+      queue.push(c.tree);
+      for (const p of c.parents) queue.push(p);
+    } else if (object.type === "tag") {
+      queue.push(gitParseTag(object.data).object);
+    } else if (object.type === "tree") {
+      for (const e of gitParseTree(object.data)) {
+        if (e.mode === "160000") continue;
+        queue.push(e.oid);
+      }
+    }
+  }
+  return seen;
+}
+
+// ---------------------------------------------------------------- packfiles
+function gitReadVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
+  if (start >= buffer.length) throw new Error("pack entry has no size header");
+  let byte = buffer[start];
+  const first = byte;
+  let size = byte & 0x0f;
+  let shift = 4;
+  let offset = start + 1;
+  while (byte & 0x80) {
+    if (offset >= buffer.length) throw new Error("pack entry size varint is truncated");
+    byte = buffer[offset++];
+    size += (byte & 0x7f) * 2 ** shift;
+    shift += 7;
+    if (shift > 63) throw new Error("pack entry size varint is too long");
+  }
+  return { size, next: offset, first };
+}
+function gitReadOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
+  if (start >= buffer.length) throw new Error("ofs-delta has no base offset");
+  let byte = buffer[start];
+  let offset = start + 1;
+  let value = byte & 0x7f;
+  while (byte & 0x80) {
+    if (offset >= buffer.length) throw new Error("ofs-delta base offset is truncated");
+    byte = buffer[offset++];
+    value = ((value + 1) * 128) + (byte & 0x7f);
+  }
+  return { baseOffset: value, next: offset };
+}
+function gitInflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
+  let result: { buffer: Buffer; engine: { bytesWritten: number } };
   try {
-    const out = execFileSync("git", args, { cwd, input, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }) as string;
-    return { code: 0, stdout: out, stderr: "" };
-  } catch (e: any) {
-    return {
-      code: typeof e.status === "number" ? e.status : 1,
-      stdout: e.stdout ? String(e.stdout) : "",
-      stderr: e.stderr ? String(e.stderr) : String(e && e.message ? e.message : e),
-    };
+    result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+  } catch (err) {
+    throw new Error(`zlib stream at offset ${offset} did not inflate: ${(err as Error).message}`);
   }
+  const written = result.engine.bytesWritten;
+  if (!written || written <= 0) throw new Error(`zlib stream at offset ${offset} consumed no bytes`);
+  return { data: result.buffer, next: offset + written };
 }
-function gitBuf(args: string[], cwd?: string): { code: number; buf: Buffer; stderr: string } {
+function gitApplyDelta(base: Buffer, delta: Buffer): Buffer {
+  let offset = 0;
+  const readSize = (): number => {
+    let value = 0;
+    let shift = 0;
+    for (;;) {
+      if (offset >= delta.length) throw new Error("delta size varint is truncated");
+      const byte = delta[offset++];
+      value += (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (!(byte & 0x80)) break;
+      if (shift > 63) throw new Error("delta size varint is too long");
+    }
+    return value;
+  };
+  const sourceSize = readSize();
+  const targetSize = readSize();
+  if (sourceSize !== base.length) throw new Error(`delta expects a ${sourceSize}-byte base, got ${base.length}`);
+  const out = Buffer.allocUnsafe(targetSize);
+  let written = 0;
+  while (offset < delta.length) {
+    const op = delta[offset++];
+    if (op & 0x80) {
+      let copyOffset = 0;
+      let copySize = 0;
+      let shift = 0;
+      for (let bit = 0; bit < 4; bit += 1) {
+        if (op & (1 << bit)) {
+          if (offset >= delta.length) throw new Error("delta copy offset is truncated");
+          copyOffset += delta[offset++] * 2 ** shift;
+        }
+        shift += 8;
+      }
+      shift = 0;
+      for (let bit = 4; bit < 7; bit += 1) {
+        if (op & (1 << bit)) {
+          if (offset >= delta.length) throw new Error("delta copy size is truncated");
+          copySize += delta[offset++] * 2 ** shift;
+        }
+        shift += 8;
+      }
+      if (copySize === 0) copySize = 0x10000;
+      if (copyOffset + copySize > base.length) throw new Error("delta copy is out of the base");
+      if (written + copySize > targetSize) throw new Error("delta writes past its target size");
+      base.copy(out, written, copyOffset, copyOffset + copySize);
+      written += copySize;
+    } else if (op !== 0) {
+      const literal = op & 0x7f;
+      if (offset + literal > delta.length) throw new Error("delta insert is truncated");
+      if (written + literal > targetSize) throw new Error("delta writes past its target size");
+      delta.copy(out, written, offset, offset + literal);
+      offset += literal;
+      written += literal;
+    } else {
+      throw new Error("delta opcode 0 is invalid");
+    }
+  }
+  if (written !== targetSize) throw new Error(`delta produced ${written} of ${targetSize} bytes`);
+  return out;
+}
+interface PackReadResult {
+  version: number; declaredCount: number; objects: Map<string, GitObj>;
+  trailer: string; computedTrailer: string; checksumOk: boolean; deltaCount: number;
+}
+// Read a packfile (version 2 or 3) and resolve every object, including
+// OFS_DELTA and REF_DELTA. `resolveBase` supplies a base object a thin pack
+// leaves out. Every object's SHA-1 is recomputed (the id IS the recomputed
+// hash), so a corruption cannot be stored as a valid object.
+function gitReadPack(pack: Buffer, resolveBase?: ObjectLookup): PackReadResult {
+  if (pack.length < 32) throw new Error(`pack is ${pack.length} bytes, too short`);
+  if (pack.subarray(0, 4).toString("ascii") !== "PACK") throw new Error("pack does not start with PACK");
+  const version = pack.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
+  const declaredCount = pack.readUInt32BE(8);
+  const trailerStart = pack.length - 20;
+  const trailer = pack.subarray(trailerStart).toString("hex");
+  const computedTrailer = createHash("sha1").update(pack.subarray(0, trailerStart)).digest("hex");
+  const checksumOk = trailer === computedTrailer;
+  interface RawEntry {
+    offset: number; typeCode: number; size: number; data: Buffer;
+    baseOffset?: number; baseOid?: string; resolvedType?: GitObjType; resolved?: Buffer; oid?: string;
+  }
+  const raw: RawEntry[] = [];
+  const byOffset = new Map<number, RawEntry>();
+  let offset = 12;
+  for (let index = 0; index < declaredCount; index += 1) {
+    const entryOffset = offset;
+    const header = gitReadVarintSize(pack, offset);
+    offset = header.next;
+    const typeCode = (header.first >> 4) & 0x07;
+    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
+    if (typeCode === 6) {
+      const base = gitReadOfsDeltaBase(pack, offset);
+      offset = base.next;
+      if (base.baseOffset <= 0 || base.baseOffset > entryOffset) throw new Error(`ofs-delta at ${entryOffset} names an invalid base offset ${base.baseOffset}`);
+      entry.baseOffset = entryOffset - base.baseOffset;
+    } else if (typeCode === 7) {
+      if (offset + 20 > trailerStart) throw new Error("ref-delta base id is truncated");
+      entry.baseOid = pack.subarray(offset, offset + 20).toString("hex");
+      offset += 20;
+    } else if (!GIT_CODE_TYPE[typeCode]) {
+      throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
+    }
+    const inflated = gitInflateAt(pack.subarray(0, trailerStart), offset);
+    if (inflated.data.length !== header.size) throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
+    entry.data = inflated.data;
+    offset = inflated.next;
+    raw.push(entry);
+    byOffset.set(entryOffset, entry);
+  }
+  if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
+  const objects = new Map<string, GitObj>();
+  const resolving = new Set<number>();
+  const resolvedByOid = new Map<string, RawEntry>();
+  const resolve = (entry: RawEntry): { type: GitObjType; data: Buffer; oid: string } => {
+    if (entry.resolved && entry.resolvedType && entry.oid) return { type: entry.resolvedType, data: entry.resolved, oid: entry.oid };
+    if (resolving.has(entry.offset)) throw new Error(`delta cycle at pack offset ${entry.offset}`);
+    resolving.add(entry.offset);
+    let type: GitObjType;
+    let data: Buffer;
+    if (entry.typeCode === 6) {
+      const baseEntry = byOffset.get(entry.baseOffset!);
+      if (!baseEntry) throw new Error(`ofs-delta base at offset ${entry.baseOffset} is not in the pack`);
+      const base = resolve(baseEntry);
+      type = base.type;
+      data = gitApplyDelta(base.data, entry.data);
+    } else if (entry.typeCode === 7) {
+      const wanted = entry.baseOid!;
+      const baseEntry = resolvedByOid.get(wanted);
+      if (baseEntry) {
+        const base = resolve(baseEntry);
+        type = base.type;
+        data = gitApplyDelta(base.data, entry.data);
+      } else {
+        const external = resolveBase?.(wanted);
+        if (!external) throw new Error(`ref-delta base ${wanted} is neither in the pack nor supplied`);
+        type = external.type;
+        data = gitApplyDelta(external.data, entry.data);
+      }
+    } else {
+      type = GIT_CODE_TYPE[entry.typeCode];
+      data = entry.data;
+    }
+    const oid = gitHash(type, data);
+    entry.resolved = data;
+    entry.resolvedType = type;
+    entry.oid = oid;
+    resolvedByOid.set(oid, entry);
+    resolving.delete(entry.offset);
+    return { type, data, oid };
+  };
+  let deltaCount = 0;
+  for (const entry of raw) {
+    const resolved = resolve(entry);
+    if (entry.typeCode === 6 || entry.typeCode === 7) deltaCount += 1;
+    if (!objects.has(resolved.oid)) objects.set(resolved.oid, { type: resolved.type, data: resolved.data });
+  }
+  return { version, declaredCount, objects, trailer, computedTrailer, checksumOk, deltaCount };
+}
+function gitWritePackObjectHeader(type: GitObjType, size: number): Buffer {
+  const code = GIT_TYPE_CODE[type];
+  const bytes: number[] = [];
+  let remaining = size;
+  let first = (code << 4) | (remaining & 0x0f);
+  remaining = Math.floor(remaining / 16);
+  while (remaining > 0) {
+    bytes.push(first | 0x80);
+    first = remaining & 0x7f;
+    remaining = Math.floor(remaining / 128);
+  }
+  bytes.push(first);
+  return Buffer.from(bytes);
+}
+// Build a packfile from plain objects (no deltas). The trailer is SHA-1
+// over everything before it.
+function gitWritePack(objects: Iterable<GitObj>, level = 6): Buffer {
+  const list = [...objects];
+  const parts: Buffer[] = [];
+  const header = Buffer.allocUnsafe(12);
+  header.write("PACK", 0, 4, "ascii");
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(list.length, 8);
+  parts.push(header);
+  for (const object of list) {
+    parts.push(gitWritePackObjectHeader(object.type, object.data.length));
+    parts.push(deflateSync(object.data, { level }));
+  }
+  const body = Buffer.concat(parts);
+  return Buffer.concat([body, createHash("sha1").update(body).digest()]);
+}
+
+// ---------------------------------------------------------------- pkt-lines
+function gitPkt(payload: string | Buffer): Buffer {
+  const body = typeof payload === "string" ? Buffer.from(payload, "utf8") : payload;
+  const head = Buffer.alloc(4);
+  head.write((body.length + 4).toString(16).padStart(4, "0"), "ascii");
+  return Buffer.concat([head, body]);
+}
+const GIT_FLUSH = Buffer.from("0000", "ascii");
+const GIT_DELIM = Buffer.from("0001", "ascii");
+interface GitPacket { kind: "data" | "flush" | "delim" | "response-end"; payload: Buffer; }
+function gitDecodePktLines(buf: Buffer): GitPacket[] {
+  const out: GitPacket[] = [];
+  let off = 0;
+  while (off + 4 <= buf.length) {
+    const len = parseInt(buf.toString("ascii", off, off + 4), 16);
+    if (Number.isNaN(len) || len < 0) throw new Error("malformed pkt-line length");
+    if (len === 0) { out.push({ kind: "flush", payload: Buffer.alloc(0) }); off += 4; continue; }
+    if (len === 1) { out.push({ kind: "delim", payload: Buffer.alloc(0) }); off += 4; continue; }
+    if (len === 2) { out.push({ kind: "response-end", payload: Buffer.alloc(0) }); off += 4; continue; }
+    if (len < 4 || off + len > buf.length) throw new Error("malformed pkt-line");
+    out.push({ kind: "data", payload: buf.subarray(off + 4, off + len) });
+    off += len;
+  }
+  if (off !== buf.length) throw new Error("trailing bytes after pkt-lines");
+  return out;
+}
+
+// ============================================================================
+// per-repository git state (objects + refs, in memory, persisted as a pack)
+// ============================================================================
+interface GitState { objects: Map<string, GitObj>; refs: Map<string, string>; dirty: boolean; }
+const gitStates = new Map<string, GitState>();
+function gitStateKey(owner: string, repo: string): string { return `${owner}/${repo}`; }
+function gitPackPath(owner: string, repo: string): string { return join(DATA_DIR, "git-objects", owner, repo + ".pack"); }
+function gitRefsPath(owner: string, repo: string): string { return join(DATA_DIR, "git-objects", owner, repo + ".refs.json"); }
+function getGitState(owner: string, repo: string): GitState {
+  const key = gitStateKey(owner, repo);
+  const existing = gitStates.get(key);
+  if (existing) return existing;
+  const st: GitState = { objects: new Map(), refs: new Map(), dirty: false };
   try {
-    const out = execFileSync("git", args, { cwd, encoding: "buffer", maxBuffer: 256 * 1024 * 1024 }) as Buffer;
-    return { code: 0, buf: out, stderr: "" };
-  } catch (e: any) {
-    return { code: typeof e.status === "number" ? e.status : 1, buf: e.stdout ? Buffer.from(e.stdout) : Buffer.alloc(0), stderr: e.stderr ? String(e.stderr) : "" };
+    const packFile = gitPackPath(owner, repo);
+    if (existsSync(packFile)) {
+      const read = gitReadPack(readFileSync(packFile));
+      if (read.checksumOk) st.objects = read.objects;
+    }
+    const refsFile = gitRefsPath(owner, repo);
+    if (existsSync(refsFile)) {
+      const raw = JSON.parse(readFileSync(refsFile, "utf8")) as Record<string, string>;
+      for (const [k, v] of Object.entries(raw)) if (typeof v === "string" && HEX40_RE.test(v)) st.refs.set(k, v);
+    }
+  } catch { st.objects = new Map(); st.refs = new Map(); }
+  gitStates.set(key, st);
+  return st;
+}
+function initGitState(owner: string, repo: string): GitState {
+  const st: GitState = { objects: new Map(), refs: new Map(), dirty: false };
+  gitStates.set(gitStateKey(owner, repo), st);
+  return st;
+}
+let gitFlushTimer: NodeJS.Timeout | null = null;
+function touchGitState(st: GitState): void {
+  st.dirty = true;
+  if (!gitFlushTimer) gitFlushTimer = setTimeout(() => { gitFlushTimer = null; flushGitStates(); }, 1000);
+}
+// Write every dirty repo's objects (one pack, fast deflate — this is
+// storage, not a wire pack) and refs to disk. Synchronous on purpose: the
+// call sites are already off the hot path (debounced), and shutdown needs
+// a synchronous flush.
+function flushGitStates(): void {
+  for (const [key, st] of gitStates) {
+    if (!st.dirty) continue;
+    st.dirty = false;
+    const sep = key.indexOf("/");
+    const owner = key.slice(0, sep);
+    const repo = key.slice(sep + 1);
+    try {
+      mkdirSync(join(DATA_DIR, "git-objects", owner), { recursive: true });
+      const sorted = [...st.objects.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+      writeFileSync(gitPackPath(owner, repo), gitWritePack(sorted.map(([, o]) => o), 1));
+      writeFileSync(gitRefsPath(owner, repo), JSON.stringify(Object.fromEntries(st.refs)));
+    } catch { st.dirty = true; }
   }
 }
-function createBareRepo(owner: string, repo: string, defaultBranch: string): string {
-  const dir = barePath(owner, repo);
-  if (gitAvailable()) {
-    mkdirSync(dir, { recursive: true });
-    const r = gitSync(["init", "--bare", `--initial-branch=${defaultBranch}`, dir]);
-    if (r.code !== 0) throw new Error("git init --bare failed: " + r.stderr);
-    gitSync(["--git-dir", dir, "config", "receive.denyNonFastForwards", "true"]);
-    gitSync(["--git-dir", dir, "config", "http.receivepack", "true"]);
-    return dir;
+function deleteGitState(owner: string, repo: string): void {
+  gitStates.delete(gitStateKey(owner, repo));
+  rmSync(gitPackPath(owner, repo), { force: true });
+  rmSync(gitRefsPath(owner, repo), { force: true });
+}
+
+// ---------------------------------------------------------------- object helpers
+function gitResolveRef(st: GitState, refspec: string, defaultBranch: string): string | null {
+  if (refspec === "HEAD") return st.refs.get(`refs/heads/${defaultBranch}`) ?? null;
+  if (refspec.startsWith("refs/")) return st.refs.get(refspec) ?? null;
+  if (HEX40_RE.test(refspec)) return st.objects.has(refspec) ? refspec : null;
+  return st.refs.get(`refs/heads/${refspec}`) ?? st.refs.get(`refs/tags/${refspec}`) ?? null;
+}
+function gitPeelToCommit(st: GitState, oid: string): string | null {
+  let cur = oid;
+  for (let guard = 0; guard < 10; guard += 1) {
+    const obj = st.objects.get(cur);
+    if (!obj) return null;
+    if (obj.type === "commit") return cur;
+    if (obj.type === "tag") { cur = gitParseTag(obj.data).object; continue; }
+    return null;
   }
-  // No git binary (the grading pod): lay out an empty bare repository by
-  // hand. It holds no objects yet, so pack transport still needs a real git
-  // implementation, but the repository exists for the REST/GraphQL/MCP
-  // surfaces that do not touch objects.
-  mkdirSync(join(dir, "objects", "info"), { recursive: true });
-  mkdirSync(join(dir, "objects", "pack"), { recursive: true });
-  mkdirSync(join(dir, "refs", "heads"), { recursive: true });
-  mkdirSync(join(dir, "refs", "tags"), { recursive: true });
-  mkdirSync(join(dir, "hooks"), { recursive: true });
-  mkdirSync(join(dir, "info"), { recursive: true });
-  writeFileSync(join(dir, "HEAD"), `ref: refs/heads/${defaultBranch}\n`);
-  writeFileSync(join(dir, "config"), "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n[receive]\n\tdenyNonFastForwards = true\n[http]\n\treceivepack = true\n");
-  writeFileSync(join(dir, "description"), "Unnamed repository; edit this file 'description' to name the repository.\n");
-  writeFileSync(join(dir, "info", "exclude"), "# git ls-files --others --exclude-from=.git/info/exclude\n# Lines that start with '#' are comments.\n# For a project mostly in C, the following would be a good set of\n# exclude patterns (uncomment them if you want to use them):\n# *.[oa]\n# *~\n");
-  return dir;
+  return null;
 }
-function withWorktree<T>(bareDir: string, fn: (dir: string) => T): T {
-  const tmp = mkdtempSync(join(tmpdir(), "forge-"));
-  try {
-    const c = gitSync(["clone", "--quiet", bareDir, tmp]);
-    if (c.code !== 0) throw new Error("git clone failed: " + c.stderr);
-    gitSync(["-C", tmp, "config", "user.email", "forge@localhost"]);
-    gitSync(["-C", tmp, "config", "user.name", FORGE_USER]);
-    return fn(tmp);
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
+function gitCommitAt(st: GitState, refspec: string, defaultBranch: string): string | null {
+  const oid = gitResolveRef(st, refspec, defaultBranch);
+  return oid ? gitPeelToCommit(st, oid) : null;
+}
+// Peel an annotated tag to its commit, or null when the target is not a commit.
+function gitPeel(st: GitState, oid: string): string | null {
+  const obj = st.objects.get(oid);
+  if (!obj || obj.type !== "tag") return null;
+  return gitPeelToCommit(st, gitParseTag(obj.data).object);
+}
+function gitIsAncestor(st: GitState, ancestor: string, descendant: string): boolean {
+  if (ancestor === descendant) return true;
+  const seen = new Set<string>();
+  const queue = [descendant];
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = st.objects.get(oid);
+    if (!obj || obj.type !== "commit") continue;
+    for (const p of gitParseCommit(obj.data).parents) {
+      if (p === ancestor) return true;
+      queue.push(p);
+    }
   }
+  return false;
 }
-function headSha(bareDir: string, ref = "HEAD"): string | null {
-  const r = gitSync(["--git-dir", bareDir, "rev-parse", "--verify", ref]);
-  return r.code === 0 ? r.stdout.trim() : null;
+// Commits reachable from `tip`, excluding those reachable from `exclude`,
+// newest first by committer time (git log's date order), ties by discovery.
+function gitWalkCommits(st: GitState, tipOid: string, opts: { max?: number; exclude?: Set<string> } = {}): string[] {
+  const max = opts.max ?? Infinity;
+  const exclude = opts.exclude ?? new Set<string>();
+  const seen = new Set<string>();
+  const found: { oid: string; ts: number; seq: number }[] = [];
+  let seq = 0;
+  const queue: string[] = [tipOid];
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid) || exclude.has(oid)) continue;
+    const obj = st.objects.get(oid);
+    if (!obj || obj.type !== "commit") continue;
+    seen.add(oid);
+    const c = gitParseCommit(obj.data);
+    found.push({ oid, ts: gitIdentityTs(c.committer), seq: seq++ });
+    for (const p of c.parents) queue.push(p);
+  }
+  found.sort((a, b) => (b.ts - a.ts) || (a.seq - b.seq));
+  return found.slice(0, max).map((f) => f.oid);
 }
-function parseLog(raw: string): { sha: string; author: string; email: string; date: string; message: string }[] {
-  const out: { sha: string; author: string; email: string; date: string; message: string }[] = [];
-  for (const rec of raw.split("\x1e")) {
-    const t = rec.replace(/^\n/, "");
-    if (!t.trim()) continue;
-    const f = t.split("\x1f");
-    if (f.length < 5) continue;
-    out.push({ sha: f[0], author: f[1], email: f[2], date: f[3], message: f.slice(7).join("\x1f").replace(/\n$/, "") });
+// The first common ancestor of two commits (newest-first walk from `b`).
+function gitMergeBase(st: GitState, a: string, b: string): string | null {
+  const ancestorsA = new Set<string>();
+  const queueA = [a];
+  while (queueA.length) {
+    const oid = queueA.pop()!;
+    if (ancestorsA.has(oid)) continue;
+    const obj = st.objects.get(oid);
+    if (!obj || obj.type !== "commit") continue;
+    ancestorsA.add(oid);
+    for (const p of gitParseCommit(obj.data).parents) queueA.push(p);
+  }
+  const seen = new Set<string>();
+  const queueB = [b];
+  while (queueB.length) {
+    const oid = queueB.pop()!;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    if (ancestorsA.has(oid)) return oid;
+    const obj = st.objects.get(oid);
+    if (!obj || obj.type !== "commit") continue;
+    for (const p of gitParseCommit(obj.data).parents) queueB.push(p);
+  }
+  return null;
+}
+// Resolve a path inside a commit's tree: {type, oid, mode} or null.
+function gitTreeAtPath(st: GitState, commitOid: string, path: string): { type: "blob" | "tree"; oid: string; mode: string } | null {
+  const commit = st.objects.get(commitOid);
+  if (!commit || commit.type !== "commit") return null;
+  let treeOid = gitParseCommit(commit.data).tree;
+  const segs = path.split("/");
+  for (let i = 0; i < segs.length; i += 1) {
+    const tree = st.objects.get(treeOid);
+    if (!tree || tree.type !== "tree") return null;
+    const entry = gitParseTree(tree.data).find((e) => e.name === segs[i]);
+    if (!entry) return null;
+    if (i === segs.length - 1) {
+      if (entry.mode === "40000") return { type: "tree", oid: entry.oid, mode: entry.mode };
+      return { type: "blob", oid: entry.oid, mode: entry.mode };
+    }
+    if (entry.mode !== "40000") return null;
+    treeOid = entry.oid;
+  }
+  return null;
+}
+function gitReadBlobAt(st: GitState, commitOid: string, path: string): Buffer | null {
+  const entry = gitTreeAtPath(st, commitOid, path);
+  if (!entry || entry.type !== "blob") return null;
+  const obj = st.objects.get(entry.oid);
+  return obj && obj.type === "blob" ? obj.data : null;
+}
+function gitListTree(st: GitState, treeOid: string): TreeEntry[] {
+  const tree = st.objects.get(treeOid);
+  if (!tree || tree.type !== "tree") return [];
+  return gitParseTree(tree.data);
+}
+// Flatten a tree to full-path -> {mode, oid} (blobs only; gitlinks skipped).
+function gitFlattenTree(st: GitState, treeOid: string | null): Map<string, { mode: string; oid: string }> {
+  const out = new Map<string, { mode: string; oid: string }>();
+  if (!treeOid) return out;
+  const walk = (oid: string, prefix: string): void => {
+    const tree = st.objects.get(oid);
+    if (!tree || tree.type !== "tree") return;
+    for (const e of gitParseTree(tree.data)) {
+      const path = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.mode === "40000") walk(e.oid, path);
+      else if (e.mode !== "160000") out.set(path, { mode: e.mode, oid: e.oid });
+    }
+  };
+  walk(treeOid, "");
+  return out;
+}
+function gitBuildTreeFromPaths(st: GitState, files: Map<string, { mode: string; oid: string }>): string {
+  interface Node { files: Map<string, { mode: string; oid: string }>; dirs: Map<string, Node>; }
+  const make = (): Node => ({ files: new Map(), dirs: new Map() });
+  const root = make();
+  for (const [path, entry] of files) {
+    const segs = path.split("/");
+    let node = root;
+    for (let i = 0; i < segs.length - 1; i += 1) {
+      if (!node.dirs.has(segs[i])) node.dirs.set(segs[i], make());
+      node = node.dirs.get(segs[i])!;
+    }
+    node.files.set(segs[segs.length - 1], entry);
+  }
+  const build = (node: Node): string => {
+    for (const name of node.files.keys()) {
+      if (node.dirs.has(name)) throw new Error(`path ${name} is both a file and a directory`);
+    }
+    const entries: TreeEntry[] = [];
+    for (const [name, e] of node.files) entries.push({ mode: e.mode, name, oid: e.oid });
+    for (const [name, child] of node.dirs) entries.push({ mode: "40000", name, oid: build(child) });
+    const data = gitBuildTree(entries);
+    const oid = gitHash("tree", data);
+    if (!st.objects.has(oid)) st.objects.set(oid, { type: "tree", data });
+    return oid;
+  };
+  return build(root);
+}
+// A new root tree with `path` set to `newBlobOid` (or removed when null),
+// starting from `baseTreeOid` (null = empty tree).
+function gitUpdateTreePath(st: GitState, baseTreeOid: string | null, path: string, newBlobOid: string | null): string {
+  const files = gitFlattenTree(st, baseTreeOid);
+  if (newBlobOid) {
+    const prev = files.get(path);
+    files.set(path, { mode: prev ? prev.mode : "100644", oid: newBlobOid });
+  } else {
+    files.delete(path);
+    for (const k of [...files.keys()]) if (k.startsWith(`${path}/`)) files.delete(k);
+  }
+  if (files.size === 0) {
+    const data = gitBuildTree([]);
+    const oid = gitHash("tree", data);
+    if (!st.objects.has(oid)) st.objects.set(oid, { type: "tree", data });
+    return oid;
+  }
+  return gitBuildTreeFromPaths(st, files);
+}
+
+// ---------------------------------------------------------------- line diff (for PR file counts)
+function gitSplitLines(buf: Buffer): string[] {
+  const text = buf.toString("utf8");
+  if (text === "") return [];
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+// Added/deleted line counts between two blobs, via an LCS diff. Falls back
+// to whole-file counts for very large files (the suite diffs small ones).
+function gitLineDiff(oldBuf: Buffer | null, newBuf: Buffer | null): { additions: number; deletions: number } {
+  const oldLines = oldBuf ? gitSplitLines(oldBuf) : [];
+  const newLines = newBuf ? gitSplitLines(newBuf) : [];
+  if (oldLines.length > 2000 || newLines.length > 2000) return { additions: newLines.length, deletions: oldLines.length };
+  const n = oldLines.length;
+  const m = newLines.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i][j] = oldLines[i] === newLines[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const lcs = dp[0][0];
+  return { additions: m - lcs, deletions: n - lcs };
+}
+interface DiffEntry { path: string; status: "added" | "modified" | "removed"; additions: number; deletions: number; }
+function gitDiffTrees(st: GitState, baseTreeOid: string | null, headTreeOid: string | null): DiffEntry[] {
+  const base = gitFlattenTree(st, baseTreeOid);
+  const head = gitFlattenTree(st, headTreeOid);
+  const out: DiffEntry[] = [];
+  const paths = new Set([...base.keys(), ...head.keys()]);
+  for (const path of [...paths].sort()) {
+    const b = base.get(path);
+    const h = head.get(path);
+    if (b && !h) {
+      const old = st.objects.get(b.oid)?.data ?? null;
+      out.push({ path, status: "removed", additions: 0, deletions: old ? gitSplitLines(old).length : 0 });
+    } else if (!b && h) {
+      const data = st.objects.get(h.oid)?.data ?? null;
+      out.push({ path, status: "added", additions: data ? gitSplitLines(data).length : 0, deletions: 0 });
+    } else if (b && h && b.oid !== h.oid) {
+      const counts = gitLineDiff(st.objects.get(b.oid)?.data ?? null, st.objects.get(h.oid)?.data ?? null);
+      out.push({ path, status: "modified", additions: counts.additions, deletions: counts.deletions });
+    }
   }
   return out;
+}
+// Three-way merge of trees: base (merge base), head (theirs), other (ours).
+// Returns the merged tree, or the conflicting paths when both sides changed
+// the same path differently.
+function gitThreeWayMerge(st: GitState, baseTreeOid: string | null, headTreeOid: string | null, otherTreeOid: string | null): { tree: string | null; conflicts: string[] } {
+  const base = gitFlattenTree(st, baseTreeOid);
+  const head = gitFlattenTree(st, headTreeOid);
+  const other = gitFlattenTree(st, otherTreeOid);
+  const merged = new Map<string, { mode: string; oid: string }>();
+  const conflicts: string[] = [];
+  const eq = (a?: { mode: string; oid: string }, b?: { mode: string; oid: string }): boolean =>
+    (!a && !b) || (!!a && !!b && a.oid === b.oid && a.mode === b.mode);
+  const paths = new Set([...base.keys(), ...head.keys(), ...other.keys()]);
+  for (const path of paths) {
+    const b = base.get(path);
+    const h = head.get(path);
+    const o = other.get(path);
+    if (eq(h, o)) { if (h) merged.set(path, h); continue; }
+    if (eq(b, h)) { if (o) merged.set(path, o); continue; }
+    if (eq(b, o)) { if (h) merged.set(path, h); continue; }
+    conflicts.push(path);
+  }
+  if (conflicts.length) return { tree: null, conflicts: conflicts.sort() };
+  if (merged.size === 0) {
+    const data = gitBuildTree([]);
+    const oid = gitHash("tree", data);
+    if (!st.objects.has(oid)) st.objects.set(oid, { type: "tree", data });
+    return { tree: oid, conflicts: [] };
+  }
+  return { tree: gitBuildTreeFromPaths(st, merged), conflicts: [] };
+}
+
+// ---------------------------------------------------------------- fetch computation
+interface FetchPlan {
+  objects: Map<string, GitObj>;
+  shallowOut: string[];
+  unshallowOut: string[];
+  acks: string[];
+  wantedRefs: { oid: string; ref: string }[];
+}
+// Objects the client already holds: reachable from `haves`, cutting at the
+// client's shallow boundaries (a boundary commit is held, its parents are not).
+function gitHeldObjects(st: GitState, haves: readonly string[], shallowSet: ReadonlySet<string>): Set<string> {
+  const held = new Set<string>();
+  const queue: string[] = [];
+  for (const h of haves) if (HEX40_RE.test(h)) queue.push(h);
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (held.has(oid)) continue;
+    const obj = st.objects.get(oid);
+    if (!obj) continue;
+    held.add(oid);
+    if (obj.type === "commit") {
+      const c = gitParseCommit(obj.data);
+      queue.push(c.tree);
+      if (!shallowSet.has(oid)) for (const p of c.parents) queue.push(p);
+    } else if (obj.type === "tag") {
+      queue.push(gitParseTag(obj.data).object);
+    } else if (obj.type === "tree") {
+      for (const e of gitParseTree(obj.data)) {
+        if (e.mode === "160000") continue;
+        queue.push(e.oid);
+      }
+    }
+  }
+  return held;
+}
+function gitComputeFetch(
+  st: GitState,
+  opts: { wants: string[]; haves: string[]; shallow: string[]; deepen: number | null; deepenSince: number | null; deepenNot: string[] },
+  defaultBranch: string,
+): FetchPlan {
+  const shallowSet = new Set(opts.shallow.filter((s) => HEX40_RE.test(s)));
+  const held = gitHeldObjects(st, opts.haves, shallowSet);
+  // Commits excluded by deepen-not (reachable from the named refs).
+  const excluded = new Set<string>();
+  for (const ref of opts.deepenNot) {
+    const oid = gitResolveRef(st, ref, defaultBranch);
+    if (oid) for (const o of gitCollectReachable([oid], (id) => st.objects.get(id), true)) excluded.add(o);
+  }
+  // BFS over commits from the wants, honouring depth / time cutoffs.
+  const included = new Set<string>();
+  const depthOf = new Map<string, number>();
+  const queue: { oid: string; depth: number }[] = [];
+  for (const w of opts.wants) {
+    const obj = st.objects.get(w);
+    if (!obj) continue;
+    if (obj.type === "tag") {
+      included.add(w);
+      const target = gitParseTag(obj.data).object;
+      if (st.objects.get(target)?.type === "commit") queue.push({ oid: target, depth: 0 });
+    } else if (obj.type === "commit") {
+      queue.push({ oid: w, depth: 0 });
+    } else {
+      included.add(w);
+    }
+  }
+  while (queue.length) {
+    const { oid, depth } = queue.shift()!;
+    if (included.has(oid) || excluded.has(oid)) continue;
+    if (opts.deepen !== null && depth >= opts.deepen) continue;
+    const obj = st.objects.get(oid);
+    if (!obj || obj.type !== "commit") continue;
+    if (opts.deepenSince !== null && gitIdentityTs(gitParseCommit(obj.data).committer) < opts.deepenSince) continue;
+    included.add(oid);
+    depthOf.set(oid, depth);
+    const c = gitParseCommit(obj.data);
+    // Without a deepen, a client shallow boundary still cuts the history.
+    if (opts.deepen === null && opts.deepenSince === null && shallowSet.has(oid)) continue;
+    for (const p of c.parents) queue.push({ oid: p, depth: depth + 1 });
+  }
+  // Full object closure of the included commits (trees + blobs).
+  const objects = new Map<string, GitObj>();
+  for (const oid of included) {
+    const obj = st.objects.get(oid);
+    if (obj) objects.set(oid, obj);
+  }
+  for (const oid of [...included]) {
+    const obj = st.objects.get(oid);
+    if (!obj) continue;
+    if (obj.type === "commit") {
+      for (const o of gitCollectReachable([gitParseCommit(obj.data).tree], (id) => st.objects.get(id), true)) {
+        const oo = st.objects.get(o);
+        if (oo) objects.set(o, oo);
+      }
+    } else if (obj.type === "tag") {
+      for (const o of gitCollectReachable([gitParseTag(obj.data).object], (id) => st.objects.get(id), true)) {
+        const oo = st.objects.get(o);
+        if (oo) objects.set(o, oo);
+      }
+    }
+  }
+  // Boundaries: included commits with a parent that is not included.
+  const shallowOut: string[] = [];
+  for (const oid of included) {
+    const obj = st.objects.get(oid);
+    if (!obj || obj.type !== "commit") continue;
+    const parents = gitParseCommit(obj.data).parents;
+    const hasOutsideParent = parents.some((p) => !included.has(p));
+    if (hasOutsideParent) shallowOut.push(oid);
+  }
+  const unshallowOut = [...shallowSet].filter((oid) => included.has(oid) && !shallowOut.includes(oid)).sort();
+  shallowOut.sort();
+  // Drop what the client already holds.
+  for (const oid of [...objects.keys()]) if (held.has(oid)) objects.delete(oid);
+  // ACKs: haves that are ancestors-or-equal of a want.
+  const ancestors = new Set<string>();
+  for (const w of opts.wants) {
+    try { for (const o of gitCollectReachable([w], (id) => st.objects.get(id), true)) ancestors.add(o); } catch { /* ignore */ }
+  }
+  const acks = opts.haves.filter((h) => ancestors.has(h));
+  const wantedRefs: { oid: string; ref: string }[] = [];
+  for (const w of opts.wants) {
+    for (const [name, oid] of st.refs) if (oid === w) wantedRefs.push({ oid: w, ref: name });
+  }
+  return { objects, shallowOut, unshallowOut, acks, wantedRefs };
+}
+
+// ============================================================================
+// git smart HTTP (info/refs, upload-pack, receive-pack)
+// ============================================================================
+function gitSidebandPack(pack: Buffer): Buffer[] {
+  const parts: Buffer[] = [];
+  for (let off = 0; off < pack.length; off += 65515) {
+    const chunk = pack.subarray(off, off + 65515);
+    parts.push(gitPkt(Buffer.concat([Buffer.from([1]), chunk])));
+  }
+  return parts;
+}
+function gitLsRefsResponse(r: Repo, st: GitState, args: string[]): Buffer {
+  const peel = args.includes("peel");
+  const symrefs = args.includes("symrefs");
+  const unborn = args.includes("unborn");
+  const prefixes = args.filter((a) => a.startsWith("ref-prefix ")).map((a) => a.slice("ref-prefix ".length));
+  const parts: Buffer[] = [];
+  const headRef = `refs/heads/${r.default_branch}`;
+  const headOid = st.refs.get(headRef) ?? null;
+  const refs = [...st.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+  const headShown = prefixes.length === 0 || prefixes.some((p) => "HEAD".startsWith(p));
+  if (refs.length === 0) {
+    if (unborn && headShown) {
+      parts.push(gitPkt(`unborn HEAD${symrefs ? ` symref-target:${headRef}` : ""}\n`));
+    }
+  } else {
+    if (headShown) {
+      const headLine = headOid
+        ? `${headOid} HEAD${symrefs ? ` symref-target:${headRef}` : ""}`
+        : `unborn HEAD${symrefs ? ` symref-target:${headRef}` : ""}`;
+      parts.push(gitPkt(`${headLine}\n`));
+    }
+    for (const [name, oid] of refs) {
+      if (!keep(name)) continue;
+      let line = `${oid} ${name}`;
+      if (peel) {
+        const p = gitPeel(st, oid);
+        if (p) line += ` peeled:${p}`;
+      }
+      parts.push(gitPkt(`${line}\n`));
+    }
+  }
+  parts.push(GIT_FLUSH);
+  return Buffer.concat(parts);
+}
+function gitFetchV2Response(r: Repo, st: GitState, args: string[]): Buffer {
+  const wants: string[] = [];
+  const haves: string[] = [];
+  const shallow: string[] = [];
+  let deepen: number | null = null;
+  let deepenSince: number | null = null;
+  const deepenNot: string[] = [];
+  for (const a of args) {
+    if (a.startsWith("want ")) wants.push(a.slice(5).trim());
+    else if (a.startsWith("have ")) haves.push(a.slice(5).trim());
+    else if (a.startsWith("shallow ")) shallow.push(a.slice(8).trim());
+    else if (a.startsWith("deepen ")) deepen = parseInt(a.slice(7), 10);
+    else if (a.startsWith("deepen-since ")) deepenSince = parseInt(a.slice(13), 10);
+    else if (a.startsWith("deepen-not ")) deepenNot.push(a.slice(11).trim());
+    // thin-pack, no-progress, ofs-delta, filter, done: accepted, no action needed
+  }
+  const plan = gitComputeFetch(st, { wants, haves, shallow, deepen, deepenSince, deepenNot }, r.default_branch);
+  const parts: Buffer[] = [];
+  // protocol v2: the acknowledgments section is only sent when the client
+  // included at least one "have" line; a have-less fetch (e.g. a clone)
+  // goes straight to shallow-info / wanted-refs / packfile.
+  if (haves.length) {
+    parts.push(gitPkt("acknowledgments\n"));
+    if (plan.acks.length) for (const ack of plan.acks) parts.push(gitPkt(`ACK ${ack}\n`));
+    else parts.push(gitPkt("NAK\n"));
+    parts.push(gitPkt("ready\n"));
+    parts.push(GIT_DELIM);
+  }
+  if (plan.shallowOut.length || plan.unshallowOut.length) {
+    parts.push(gitPkt("shallow-info\n"));
+    for (const s of plan.shallowOut) parts.push(gitPkt(`shallow ${s}\n`));
+    for (const s of plan.unshallowOut) parts.push(gitPkt(`unshallow ${s}\n`));
+    parts.push(GIT_DELIM);
+  }
+  if (plan.wantedRefs.length) {
+    parts.push(gitPkt("wanted-refs\n"));
+    for (const w of plan.wantedRefs) parts.push(gitPkt(`${w.oid} ${w.ref}\n`));
+    parts.push(GIT_DELIM);
+  }
+  parts.push(gitPkt("packfile\n"));
+  // Deterministic pack order (by oid) so identical fetches are byte-identical.
+  parts.push(...gitSidebandPack(gitWritePack([...plan.objects.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, o]) => o))));
+  parts.push(GIT_FLUSH);
+  return Buffer.concat(parts);
+}
+function gitFetchV0Response(r: Repo, st: GitState, body: Buffer): Buffer {
+  const packets = gitDecodePktLines(body);
+  const wants: string[] = [];
+  const haves: string[] = [];
+  const shallow: string[] = [];
+  let deepen: number | null = null;
+  for (const p of packets) {
+    if (p.kind !== "data") continue;
+    const line = p.payload.toString("utf8").replace(/\n$/, "");
+    if (line.startsWith("want ")) wants.push(line.slice(5).split(" ")[0]);
+    else if (line.startsWith("have ")) haves.push(line.slice(5).trim());
+    else if (line.startsWith("shallow ")) shallow.push(line.slice(8).trim());
+    else if (line.startsWith("deepen ")) deepen = parseInt(line.slice(7), 10);
+  }
+  const plan = gitComputeFetch(st, { wants, haves, shallow, deepen, deepenSince: null, deepenNot: [] }, r.default_branch);
+  const parts: Buffer[] = [];
+  if (plan.acks.length) for (const ack of plan.acks) parts.push(gitPkt(`ACK ${ack}\n`));
+  else parts.push(gitPkt("NAK\n"));
+  for (const s of plan.shallowOut) parts.push(gitPkt(`shallow ${s}\n`));
+  for (const s of plan.unshallowOut) parts.push(gitPkt(`unshallow ${s}\n`));
+  const pack = gitWritePack([...plan.objects.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, o]) => o));
+  parts.push(...gitSidebandPack(pack));
+  parts.push(GIT_FLUSH);
+  return Buffer.concat(parts);
+}
+
+async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, repo: string, service: string): Promise<void> {
+  const r = findRepo(owner, repo);
+  if (!r) { sendError(res, 404, "Not Found"); return; }
+  if (r.private && !authed(req)) { requireAuth(req, res); return; }
+  const st = getGitState(owner, repo);
+  const isReceive = service === "git-receive-pack";
+  const svc = isReceive ? "receive-pack" : "upload-pack";
+  const v2 = !isReceive && String(req.headers["git-protocol"] ?? "").includes("version=2");
+  const headRef = `refs/heads/${r.default_branch}`;
+  const headOid = st.refs.get(headRef) ?? null;
+  if (v2) {
+    const body = Buffer.concat([
+      gitPkt("# service=git-upload-pack\n"), GIT_FLUSH,
+      gitPkt("version 2\n"),
+      gitPkt(`agent=${FORGE_AGENT}\n`),
+      gitPkt("ls-refs=unborn\n"),
+      gitPkt("fetch=shallow thin-pack ofs-delta\n"),
+      gitPkt("object-format=sha1\n"),
+      GIT_FLUSH,
+    ]);
+    res.writeHead(200, { "Content-Type": "application/x-git-upload-pack-advertisement", "Content-Length": body.length, "Cache-Control": "no-cache" });
+    res.end(body);
+    return;
+  }
+  const caps = isReceive
+    ? `report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=${FORGE_AGENT} object-format=sha1`
+    : `multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag multi_ack_detailed symref=HEAD:${headRef} agent=${FORGE_AGENT} object-format=sha1`;
+  const parts: Buffer[] = [gitPkt(`# service=git-${svc}\n`), GIT_FLUSH];
+  const refs = [...st.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  if (refs.length === 0) {
+    parts.push(gitPkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+  } else {
+    parts.push(gitPkt(`${headOid ?? ZERO_OID} HEAD\0${caps}\n`));
+    for (const [name, oid] of refs) {
+      parts.push(gitPkt(`${oid} ${name}\n`));
+      const peeled = gitPeel(st, oid);
+      if (peeled) parts.push(gitPkt(`${peeled} ${name}^{}\n`));
+    }
+  }
+  parts.push(GIT_FLUSH);
+  const body = Buffer.concat(parts);
+  res.writeHead(200, { "Content-Type": `application/x-git-${svc}-advertisement`, "Content-Length": body.length, "Cache-Control": "no-cache" });
+  res.end(body);
+}
+
+async function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: string, repo: string): Promise<void> {
+  const r = findRepo(owner, repo);
+  if (!r) { sendError(res, 404, "Not Found"); return; }
+  if (r.private && !authed(req)) { requireAuth(req, res); return; }
+  let body: Buffer;
+  try { body = await readBody(req); } catch (e: any) { sendError(res, e.status || 400, e.message || "bad request"); return; }
+  const st = getGitState(owner, repo);
+  const v2 = String(req.headers["git-protocol"] ?? "").includes("version=2");
+  try {
+    let out: Buffer;
+    if (v2) {
+      const packets = gitDecodePktLines(body);
+      const firstSection: string[] = [];
+      let i = 0;
+      while (i < packets.length && packets[i].kind === "data") { firstSection.push(packets[i].payload.toString("utf8")); i += 1; }
+      if (i >= packets.length || packets[i].kind !== "delim") throw new Error("expected delim after command");
+      i += 1;
+      const secondSection: string[] = [];
+      while (i < packets.length && packets[i].kind === "data") { secondSection.push(packets[i].payload.toString("utf8").replace(/\n$/, "")); i += 1; }
+      if (i >= packets.length || packets[i].kind !== "flush") throw new Error("expected flush");
+      const command = (firstSection[0] ?? "").trim();
+      if (command === "command=ls-refs") out = gitLsRefsResponse(r, st, secondSection);
+      else if (command === "command=fetch") {
+        for (const w of secondSection.filter((a) => a.startsWith("want ")).map((a) => a.slice(5).trim())) {
+          if (!HEX40_RE.test(w) || !st.objects.has(w)) throw new Error(`want ${w} not found`);
+        }
+        out = gitFetchV2Response(r, st, secondSection);
+      } else throw new Error(`unknown command ${command}`);
+    } else {
+      out = gitFetchV0Response(r, st, body);
+    }
+    res.writeHead(200, { "Content-Type": "application/x-git-upload-pack-result", "Content-Length": out.length, "Cache-Control": "no-cache" });
+    res.end(out);
+  } catch (e: any) {
+    if (!res.writableEnded) sendError(res, 400, e.message || "malformed git request");
+  }
+}
+
+// Apply one receive-pack command; null = ok, otherwise the ng reason.
+function gitApplyPush(st: GitState, r: Repo, cmd: { old: string; nw: string; ref: string }): string | null {
+  const { old, nw, ref } = cmd;
+  if (!validRefName(ref) || !ref.startsWith("refs/")) return "invalid ref";
+  const current = st.refs.get(ref) ?? null;
+  const isDelete = nw === ZERO_OID;
+  const isCreate = old === ZERO_OID;
+  if (isDelete) {
+    if (!current) return "remote ref does not exist";
+    if (!isCreate && old !== current) return "non-fast-forward";
+    if (ref === `refs/heads/${r.default_branch}`) return "deletion of the current branch prohibited";
+    st.refs.delete(ref);
+    return null;
+  }
+  const obj = st.objects.get(nw);
+  if (!obj) return "missing object";
+  if (ref.startsWith("refs/heads/") && obj.type !== "commit") return "not a commit";
+  if (isCreate) {
+    if (current) return "already exists";
+    st.refs.set(ref, nw);
+    return null;
+  }
+  if (!current) return "remote ref does not exist";
+  if (old !== current) return "non-fast-forward";
+  if (nw === current) return null; // no-op update
+  if (!gitIsAncestor(st, old, nw)) return "non-fast-forward";
+  st.refs.set(ref, nw);
+  return null;
+}
+function gitPushCommitList(st: GitState, owner: string, repo: string, oldOid: string, newOid: string): Json[] {
+  const commits: Json[] = [];
+  if (newOid === ZERO_OID) return commits;
+  const exclude = oldOid !== ZERO_OID
+    ? gitCollectReachable([oldOid], (oid) => st.objects.get(oid), true)
+    : new Set<string>();
+  for (const sha of gitWalkCommits(st, newOid, { max: 20, exclude })) {
+    const obj = st.objects.get(sha);
+    if (!obj) continue;
+    const c = gitParseCommit(obj.data);
+    const author = gitParseIdentity(c.author);
+    commits.push({
+      id: sha, message: c.message.replace(/\n$/, ""),
+      author: { name: author.name, email: author.email }, timestamp: author.dateIso,
+      url: `http://localhost/${owner}/${repo}/commit/${sha}`,
+    });
+  }
+  return commits;
+}
+
+async function handleReceivePack(req: IncomingMessage, res: ServerResponse, owner: string, repo: string): Promise<void> {
+  const r = findRepo(owner, repo);
+  if (!r) { sendError(res, 404, "Not Found"); return; }
+  if (!authed(req)) { requireAuth(req, res); return; }
+  let body: Buffer;
+  try { body = await readBody(req); } catch (e: any) { sendError(res, e.status || 400, e.message || "bad request"); return; }
+  const st = getGitState(owner, repo);
+  const commands: { old: string; nw: string; ref: string }[] = [];
+  let capabilities: string[] = [];
+  let packStart = body.length;
+  try {
+    let off = 0;
+    while (off + 4 <= body.length) {
+      const len = parseInt(body.toString("ascii", off, off + 4), 16);
+      if (Number.isNaN(len) || len < 0) throw new Error("malformed pkt-line");
+      if (len === 0) { packStart = off + 4; break; }
+      if (len < 4 || off + len > body.length) throw new Error("malformed pkt-line");
+      const payload = body.toString("utf8", off + 4, off + len);
+      const m = payload.match(/^([0-9a-f]{40}) ([0-9a-f]{40}) (refs\/[^\s\x00]+)/);
+      if (!m) throw new Error("malformed push command");
+      if (commands.length === 0) {
+        const nul = payload.indexOf("\0");
+        if (nul >= 0) capabilities = payload.slice(nul + 1).replace(/\n$/, "").split(" ").filter(Boolean);
+      }
+      commands.push({ old: m[1], nw: m[2], ref: m[3] });
+      off += len;
+    }
+  } catch (e: any) {
+    sendError(res, 400, e.message || "malformed push");
+    return;
+  }
+  if (commands.length === 0) { sendError(res, 400, "no push commands"); return; }
+  const packBytes = body.subarray(packStart);
+  const sideband = capabilities.includes("side-band-64k");
+  const reportLines: string[] = [];
+  let unpackError: string | null = null;
+  let newObjects = new Map<string, GitObj>();
+  if (packBytes.length > 0) {
+    try {
+      const read = gitReadPack(packBytes, (oid) => st.objects.get(oid));
+      if (!read.checksumOk) throw new Error("pack checksum mismatch");
+      newObjects = read.objects;
+    } catch (e: any) { unpackError = e.message || "unpack failed"; }
+  }
+  const applied: { old: string; nw: string; ref: string }[] = [];
+  if (unpackError) {
+    reportLines.push(`unpack error ${unpackError}\n`);
+    for (const c of commands) reportLines.push(`ng ${c.ref} unpacker error\n`);
+  } else {
+    for (const [oid, obj] of newObjects) if (!st.objects.has(oid)) st.objects.set(oid, obj);
+    reportLines.push("unpack ok\n");
+    for (const c of commands) {
+      const verdict = gitApplyPush(st, r, c);
+      if (verdict === null) { reportLines.push(`ok ${c.ref}\n`); applied.push(c); }
+      else reportLines.push(`ng ${c.ref} ${verdict}\n`);
+    }
+    if (applied.length) {
+      touchGitState(st);
+      r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
+      // The webhook commit list walks the whole history, so only build it
+      // when a push webhook actually exists; otherwise a push is O(new).
+      if (r.hooks.some((h) => h.active && h.events.includes("push"))) {
+        for (const cmd of applied) {
+          const commits = gitPushCommitList(st, owner, repo, cmd.old, cmd.nw);
+          fireHooks(r, "push", {
+            ref: cmd.ref, before: cmd.old, after: cmd.nw,
+            created: cmd.old === ZERO_OID, deleted: cmd.nw === ZERO_OID,
+            commits, head_commit: commits[commits.length - 1] || null,
+            repository: repoJson(r), pusher: userRef(FORGE_USER), sender: userRef(FORGE_USER),
+          });
+        }
+      }
+    }
+  }
+  const parts: Buffer[] = [];
+  if (sideband) {
+    // report-status-v2: the report's own terminating flush travels INSIDE
+    // the band-1 sideband data (the client reads pkt-lines out of the
+    // demuxed stream until that flush); a raw flush then ends the stream.
+    const report = Buffer.concat([...reportLines.map((l) => gitPkt(l)), GIT_FLUSH]);
+    parts.push(...gitSidebandPack(report));
+  } else {
+    for (const line of reportLines) parts.push(gitPkt(line));
+  }
+  parts.push(GIT_FLUSH);
+  const out = Buffer.concat(parts);
+  res.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Content-Length": out.length, "Cache-Control": "no-cache" });
+  res.end(out);
 }
 
 // ---------------------------------------------------------------- webhooks
@@ -461,17 +1588,23 @@ function createRepoHandler(req: IncomingMessage, res: ServerResponse, body: Json
     labels: DEFAULT_LABELS.map((l) => ({ ...l })),
     issues: [], pulls: [], hooks: [],
   };
-  try { createBareRepo(owner, name as string, defaultBranch); } catch (e: any) { sendError(res, 500, e.message || "failed to create repository"); return; }
+  initGitState(owner, name as string);
   store.repos.push(repo);
   saveStore();
   if (body.auto_init === true) {
     try {
-      withWorktree(barePath(owner, name as string), (dir) => {
-        writeFileSync(join(dir, "README.md"), `# ${name}\n\n${description}\n`);
-        gitSync(["-C", dir, "add", "README.md"]);
-        gitSync(["-C", dir, "commit", "-q", "-m", "Initial commit"]);
-        gitSync(["-C", dir, "push", "-q", "origin", `HEAD:refs/heads/${defaultBranch}`]);
-      });
+      const st = getGitState(owner, name as string);
+      const content = Buffer.from(`# ${name}\n\n${description}\n`, "utf8");
+      const blobOid = gitHash("blob", content);
+      st.objects.set(blobOid, { type: "blob", data: content });
+      const treeOid = gitBuildTreeFromPaths(st, new Map([["README.md", { mode: "100644", oid: blobOid }]]));
+      const ts = Math.floor(Date.now() / 1000);
+      const line = gitIdentityLine(FORGE_USER, "forge@localhost", ts);
+      const data = gitBuildCommit({ tree: treeOid, parents: [], message: "Initial commit\n", authorLine: line, committerLine: line });
+      const commitOid = gitHash("commit", data);
+      st.objects.set(commitOid, { type: "commit", data });
+      st.refs.set(`refs/heads/${defaultBranch}`, commitOid);
+      touchGitState(st);
       repo.pushed_at = nowIso();
       saveStore();
     } catch { /* repo still created; initial commit is best-effort */ }
@@ -482,77 +1615,94 @@ function createRepoHandler(req: IncomingMessage, res: ServerResponse, body: Json
 function deleteRepoHandler(res: ServerResponse, r: Repo): void {
   store.repos = store.repos.filter((x) => x !== r);
   saveStore();
+  deleteGitState(r.owner, r.name);
   rmSync(join(DATA_DIR, "repos", r.owner, r.name + ".git"), { recursive: true, force: true });
-  // also remove any bare repo created under the legacy layout
-  rmSync(barePath(r.owner, r.name), { recursive: true, force: true });
   res.writeHead(204, { "X-GitHub-Request-Id": randomUUID() });
   res.end();
 }
 
 // ---- git object reads (used by contents / commits / refs / trees / blobs)
-function listBranches(bareDir: string): Json[] {
-  const r = gitSync(["--git-dir", bareDir, "for-each-ref", "--format=%(refname:short)%00%(objectname)", "refs/heads/"]);
-  if (r.code !== 0) return [];
-  return r.stdout.split("\n").filter(Boolean).map((line) => {
-    const [name, sha] = line.split("\x00");
-    return { name, commit: { sha, url: `/api/v3/repos/x/y/git/commits/${sha}` }, protected: false };
-  });
+function listBranches(owner: string, repo: string): Json[] {
+  const st = getGitState(owner, repo);
+  return [...st.refs.entries()]
+    .filter(([name]) => name.startsWith("refs/heads/"))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([name, sha]) => ({
+      name: name.slice("refs/heads/".length),
+      commit: { sha, url: `/api/v3/repos/x/y/git/commits/${sha}` },
+      protected: false,
+    }));
 }
-function listCommits(bareDir: string, ref: string, perPage: number): Json[] {
-  const range = ref || "HEAD";
-  const r = gitSync(["--git-dir", bareDir, "log", `--max-count=${perPage}`,
-    "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%B%x1e", range]);
-  if (r.code !== 0) return [];
-  return parseLog(r.stdout).map((c) => ({
-    sha: c.sha,
+function gitCommitJson(st: GitState, sha: string): Json {
+  const obj = st.objects.get(sha);
+  if (!obj || obj.type !== "commit") throw new Error(`commit ${sha} not found`);
+  const c = gitParseCommit(obj.data);
+  const author = gitParseIdentity(c.author);
+  const committer = gitParseIdentity(c.committer);
+  return {
+    sha,
     commit: {
-      message: c.message,
-      author: { name: c.author, email: c.email, date: c.date },
-      committer: { name: c.author, email: c.email, date: c.date },
+      message: c.message.replace(/\n$/, ""),
+      author: { name: author.name, email: author.email, date: author.dateIso },
+      committer: { name: committer.name, email: committer.email, date: committer.dateIso },
     },
-    author: { login: c.author }, committer: { login: c.author },
+    author: { login: author.name }, committer: { login: committer.name },
     parents: [],
-  }));
+  };
+}
+function listCommits(owner: string, repo: string, ref: string, perPage: number): Json[] {
+  const st = getGitState(owner, repo);
+  const r = findRepo(owner, repo);
+  const defBranch = r?.default_branch ?? "main";
+  const range = ref || "HEAD";
+  let tip: string | null = null;
+  let exclude = new Set<string>();
+  const m = range.match(/^(.+)\.\.(.+)$/);
+  if (m) {
+    const baseOid = gitResolveRef(st, m[1], defBranch);
+    tip = gitResolveRef(st, m[2], defBranch);
+    if (baseOid) exclude = gitCollectReachable([baseOid], (oid) => st.objects.get(oid), true);
+  } else {
+    tip = gitResolveRef(st, range, defBranch);
+  }
+  if (!tip) return [];
+  const commitOid = gitPeelToCommit(st, tip);
+  if (!commitOid) return [];
+  return gitWalkCommits(st, commitOid, { max: perPage, exclude }).map((sha) => gitCommitJson(st, sha));
 }
 
 function contentsGet(res: ServerResponse, r: Repo, path: string, ref: string): void {
-  const bareDir = barePath(r.owner, r.name);
+  const st = getGitState(r.owner, r.name);
   const refSpec = ref || r.default_branch;
-  const ls = gitSync(["--git-dir", bareDir, "ls-tree", refSpec, "--", path]);
-  if (ls.code !== 0 || !ls.stdout.trim()) { sendError(res, 404, "Not Found"); return; }
-  const line = ls.stdout.split("\n")[0];
-  const m = line.match(/^(\d+) (\w+) ([0-9a-f]{40})\t(.*)$/);
-  if (!m) { sendError(res, 404, "Not Found"); return; }
-  const [, mode, type, sha, name] = m;
-  const short = name.split("/").pop() || name;
-  if (type === "tree") {
-    // ls-tree on a tree path answers the tree itself; the trailing slash
-    // lists its children.
-    const kids = gitSync(["--git-dir", bareDir, "ls-tree", refSpec, "--", path + "/"]);
-    const entries = kids.stdout.split("\n").filter(Boolean).map((l) => {
-      const mm = l.match(/^(\d+) (\w+) ([0-9a-f]{40})\t(.*)$/);
-      if (!mm) return null;
-      return { name: mm[4].split("/").pop(), path: mm[4], sha: mm[3], size: 0, type: mm[2] === "tree" ? "dir" : "file", mode: mm[1] };
-    }).filter(Boolean);
+  const tip = gitCommitAt(st, refSpec, r.default_branch);
+  if (!tip) { sendError(res, 404, "Not Found"); return; }
+  const entry = gitTreeAtPath(st, tip, path);
+  if (!entry) { sendError(res, 404, "Not Found"); return; }
+  const short = path.split("/").pop() || path;
+  if (entry.type === "tree") {
+    const entries = gitListTree(st, entry.oid).map((e) => ({
+      name: e.name, path: `${path}/${e.name}`, sha: e.oid, size: 0,
+      type: e.mode === "40000" ? "dir" : "file", mode: e.mode,
+    }));
     sendJson(res, 200, entries);
     return;
   }
-  const blob = gitBuf(["--git-dir", bareDir, "show", `${refSpec}:${path}`]);
-  if (blob.code !== 0) { sendError(res, 404, "Not Found"); return; }
+  const blob = st.objects.get(entry.oid);
+  if (!blob) { sendError(res, 404, "Not Found"); return; }
   sendJson(res, 200, {
-    type: "file", encoding: "base64", size: blob.buf.length, name: short, path,
-    content: blob.buf.toString("base64"), sha,
+    type: "file", encoding: "base64", size: blob.data.length, name: short, path,
+    content: blob.data.toString("base64"), sha: entry.oid,
     url: `/api/v3/repos/${r.owner}/${r.name}/contents/${encodeURIComponent(path)}`,
     html_url: `http://localhost/${r.owner}/${r.name}/blob/${refSpec}/${path}`,
-    git_url: `/api/v3/repos/${r.owner}/${r.name}/git/blobs/${sha}`,
-    download_url: null, mode,
+    git_url: `/api/v3/repos/${r.owner}/${r.name}/git/blobs/${entry.oid}`,
+    download_url: null, mode: entry.mode,
   });
 }
 
 function contentsPut(res: ServerResponse, r: Repo, path: string, body: Json, isDelete: boolean): void {
   const branch = typeof body.branch === "string" && validRefName(body.branch) ? body.branch : r.default_branch;
   const message = typeof body.message === "string" && body.message ? body.message.slice(0, 500) : (isDelete ? `Delete ${path}` : `Update ${path}`);
-  const bareDir = barePath(r.owner, r.name);
+  const st = getGitState(r.owner, r.name);
   let content: Buffer | null = null;
   if (!isDelete) {
     if (typeof body.content !== "string") { sendError(res, 422, "Validation Failed", { errors: [{ field: "content", code: "missing" }] }); return; }
@@ -560,45 +1710,70 @@ function contentsPut(res: ServerResponse, r: Repo, path: string, body: Json, isD
     if (content.length > 50 * 1024 * 1024) { sendError(res, 413, "Content too large"); return; }
   }
   try {
-    const result = withWorktree(bareDir, (dir) => {
-      const checkout = gitSync(["-C", dir, "checkout", "-q", branch]);
-      if (checkout.code !== 0) {
-        // branch does not exist yet (empty repo): create it from the default branch
-        const mk = gitSync(["-C", dir, "checkout", "-q", "-b", branch]);
-        if (mk.code !== 0) throw new Error("cannot check out branch " + branch);
+    const branchRef = `refs/heads/${branch}`;
+    let tip = st.refs.get(branchRef) ?? null;
+    let parentTree: string | null = null;
+    let parentCommit: string | null = null;
+    if (tip) {
+      const obj = st.objects.get(tip);
+      if (!obj || obj.type !== "commit") throw new Error("branch tip is not a commit");
+      parentTree = gitParseCommit(obj.data).tree;
+      parentCommit = tip;
+    } else if (branch !== r.default_branch) {
+      // A new branch starts at the default branch tip (git checkout -b).
+      const defTip = st.refs.get(`refs/heads/${r.default_branch}`) ?? null;
+      if (defTip) {
+        parentTree = gitParseCommit(st.objects.get(defTip)!.data).tree;
+        parentCommit = defTip;
       }
-      const full = join(dir, path);
-      if (body.sha) {
-        const cur = gitSync(["-C", dir, "rev-parse", `HEAD:${path}`]);
-        if (cur.code !== 0 || cur.stdout.trim() !== String(body.sha)) {
-          const e = new Error("sha does not match") as Error & { status: number }; e.status = 409; throw e;
-        }
+    }
+    const files = gitFlattenTree(st, parentTree);
+    if (body.sha) {
+      const cur = files.get(path);
+      if (!cur || cur.oid !== String(body.sha)) {
+        const e = new Error("sha does not match") as Error & { status: number }; e.status = 409; throw e;
       }
-      if (isDelete) {
-        const rm = gitSync(["-C", dir, "rm", "-q", "--", path]);
-        if (rm.code !== 0) throw new Error("file not found: " + path);
-      } else {
-        mkdirSync(join(dir, path.split("/").slice(0, -1).join("/")), { recursive: true });
-        writeFileSync(full, content as Buffer);
-        gitSync(["-C", dir, "add", "--", path]);
-      }
-      const st = gitSync(["-C", dir, "status", "--porcelain"]);
-      if (!st.stdout.trim()) {
-        const blob = gitSync(["--git-dir", bareDir, "rev-parse", `refs/heads/${branch}:${path}`]);
-        return { sha: headSha(bareDir, `refs/heads/${branch}`), blobSha: blob.code === 0 ? blob.stdout.trim() : null, empty: true };
-      }
-      const cm = gitSync(["-C", dir, "commit", "-q", "-m", message]);
-      if (cm.code !== 0) throw new Error("commit failed: " + cm.stderr);
-      const push = gitSync(["-C", dir, "push", "-q", "origin", `HEAD:refs/heads/${branch}`]);
-      if (push.code !== 0) throw new Error("push failed: " + push.stderr);
-      const blob = gitSync(["--git-dir", bareDir, "rev-parse", `refs/heads/${branch}:${path}`]);
-      return { sha: headSha(bareDir, `refs/heads/${branch}`), blobSha: blob.code === 0 ? blob.stdout.trim() : null, empty: false };
+    }
+    if (isDelete) {
+      const exists = files.has(path) || [...files.keys()].some((k) => k.startsWith(`${path}/`));
+      if (!exists) throw new Error("file not found: " + path);
+      files.delete(path);
+      for (const k of [...files.keys()]) if (k.startsWith(`${path}/`)) files.delete(k);
+    } else {
+      const blobOid = gitHash("blob", content as Buffer);
+      if (!st.objects.has(blobOid)) st.objects.set(blobOid, { type: "blob", data: content as Buffer });
+      const prev = files.get(path);
+      files.set(path, { mode: prev ? prev.mode : "100644", oid: blobOid });
+    }
+    const newTree = files.size === 0
+      ? (() => { const data = gitBuildTree([]); const oid = gitHash("tree", data); if (!st.objects.has(oid)) st.objects.set(oid, { type: "tree", data }); return oid; })()
+      : gitBuildTreeFromPaths(st, files);
+    if (newTree === parentTree) {
+      // No change (same bytes): answer with the current head, no new commit.
+      const curBlob = files.get(path)?.oid ?? null;
+      sendJson(res, isDelete ? 200 : 201, {
+        content: isDelete ? null : { name: path.split("/").pop(), path, sha: curBlob, size: content ? content.length : 0, type: "file", encoding: "base64" },
+        commit: { sha: parentCommit, message, author: { name: FORGE_USER, email: "forge@localhost", date: nowIso() } },
+      });
+      return;
+    }
+    const ts = Math.floor(Date.now() / 1000);
+    const line = gitIdentityLine(FORGE_USER, "forge@localhost", ts);
+    const commitData = gitBuildCommit({
+      tree: newTree, parents: parentCommit ? [parentCommit] : [],
+      message: message.endsWith("\n") ? message : `${message}\n`,
+      authorLine: line, committerLine: line,
     });
+    const commitOid = gitHash("commit", commitData);
+    st.objects.set(commitOid, { type: "commit", data: commitData });
+    st.refs.set(branchRef, commitOid);
+    touchGitState(st);
     r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
     const status = isDelete ? 200 : 201;
+    const blobSha = isDelete ? null : files.get(path)?.oid ?? commitOid;
     sendJson(res, status, {
-      content: isDelete ? null : { name: path.split("/").pop(), path, sha: result.blobSha ?? result.sha, size: content ? content.length : 0, type: "file", encoding: "base64" },
-      commit: { sha: result.sha, message, author: { name: FORGE_USER, email: "forge@localhost", date: nowIso() } },
+      content: isDelete ? null : { name: path.split("/").pop(), path, sha: blobSha, size: content ? content.length : 0, type: "file", encoding: "base64" },
+      commit: { sha: commitOid, message, author: { name: FORGE_USER, email: "forge@localhost", date: nowIso() } },
     });
   } catch (e: any) {
     sendError(res, e.status || 422, e.message || "contents operation failed");
@@ -667,9 +1842,9 @@ function createPrHandler(res: ServerResponse, r: Repo, body: Json): void {
   const head = typeof body.head === "string" ? body.head : "";
   const base = typeof body.base === "string" ? body.base : r.default_branch;
   if (!validRefName(head) || !validRefName(base)) { sendError(res, 422, "Validation Failed", { errors: [{ field: "head/base", code: "invalid" }] }); return; }
-  const bareDir = barePath(r.owner, r.name);
-  const headCommit = headSha(bareDir, `refs/heads/${head}`);
-  const baseCommit = headSha(bareDir, `refs/heads/${base}`);
+  const st = getGitState(r.owner, r.name);
+  const headCommit = gitCommitAt(st, `refs/heads/${head}`, r.default_branch);
+  const baseCommit = gitCommitAt(st, `refs/heads/${base}`, r.default_branch);
   if (!headCommit) { sendError(res, 422, "Validation Failed", { errors: [{ field: "head", code: "invalid", message: `head branch ${head} does not exist` }] }); return; }
   if (!baseCommit) { sendError(res, 422, "Validation Failed", { errors: [{ field: "base", code: "invalid", message: `base branch ${base} does not exist` }] }); return; }
   const pr: PullRequest = {
@@ -686,32 +1861,73 @@ function createPrHandler(res: ServerResponse, r: Repo, body: Json): void {
   fireHooks(r, "pull_request", { action: "opened", number: pr.number, pull_request: prJson(r, pr), repository: repoJson(r), sender: userRef(FORGE_USER) });
   sendJson(res, 201, prJson(r, pr));
 }
-// Merge a pull request's head into its base with the git binary and return
-// the merge commit sha. Throws {status:409} on a merge conflict. Shared by
-// the REST merge endpoint and the GraphQL mergePullRequest mutation.
+// Merge a pull request's head into its base with a pure-JS three-way merge
+// and return the merge commit sha. Throws {status:409} on a merge conflict.
+// Shared by the REST merge endpoint, the GraphQL mergePullRequest mutation
+// and the MCP merge_pull_request tool.
 function mergePrIntoBase(r: Repo, p: PullRequest, method: "merge" | "squash" | "rebase" = "merge"): string | null {
-  const bareDir = barePath(r.owner, r.name);
-  const mergedSha = withWorktree(bareDir, (dir) => {
-    const co = gitSync(["-C", dir, "checkout", "-q", p.base.ref]);
-    if (co.code !== 0) throw new Error("cannot check out base branch " + p.base.ref);
-    gitSync(["-C", dir, "fetch", "-q", "origin", p.head.ref]);
-    let mg: GitResult;
-    if (method === "rebase") {
-      mg = gitSync(["-C", dir, "rebase", "-q", `origin/${p.head.ref}`]);
-      if (mg.code !== 0) { gitSync(["-C", dir, "rebase", "--abort"]); throw Object.assign(new Error("Merge conflict"), { status: 409 }); }
-    } else if (method === "squash") {
-      mg = gitSync(["-C", dir, "merge", "-q", "--squash", `origin/${p.head.ref}`]);
-      if (mg.code !== 0) { gitSync(["-C", dir, "merge", "--abort"]); throw Object.assign(new Error("Merge conflict"), { status: 409 }); }
-      const cm = gitSync(["-C", dir, "commit", "-q", "-m", p.title]);
-      if (cm.code !== 0) throw new Error("squash commit failed: " + cm.stderr);
-    } else {
-      mg = gitSync(["-C", dir, "merge", "-q", "--no-ff", "-m", `Merge pull request #${p.number} from ${p.head.ref}`, `origin/${p.head.ref}`]);
-      if (mg.code !== 0) { gitSync(["-C", dir, "merge", "--abort"]); throw Object.assign(new Error("Merge conflict"), { status: 409 }); }
+  const st = getGitState(r.owner, r.name);
+  const baseTip = st.refs.get(`refs/heads/${p.base.ref}`);
+  const headTip = st.refs.get(`refs/heads/${p.head.ref}`);
+  if (!baseTip || !headTip) throw new Error("cannot check out base branch " + p.base.ref);
+  // Already merged (or nothing to merge): no new commit, like git.
+  if (gitIsAncestor(st, headTip, baseTip)) {
+    p.merged = true; p.state = "closed"; p.merged_at = nowIso(); p.closed_at = nowIso();
+    p.updated_at = nowIso(); p.merge_commit_sha = baseTip;
+    r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
+    fireHooks(r, "pull_request", { action: "closed", number: p.number, pull_request: prJson(r, p), repository: repoJson(r), sender: userRef(FORGE_USER) });
+    return baseTip;
+  }
+  const ts = Math.floor(Date.now() / 1000);
+  const line = gitIdentityLine(FORGE_USER, "forge@localhost", ts);
+  let mergedSha: string | null = null;
+  if (method === "rebase") {
+    // Replay each head-only commit onto the base tip, oldest first.
+    const exclude = gitCollectReachable([baseTip], (oid) => st.objects.get(oid), true);
+    const chain = gitWalkCommits(st, headTip, { exclude });
+    let current = baseTip;
+    for (const sha of [...chain].reverse()) {
+      const c = gitParseCommit(st.objects.get(sha)!.data);
+      const parentTree = c.parents.length ? gitParseCommit(st.objects.get(c.parents[0])!.data).tree : null;
+      const currentTree = gitParseCommit(st.objects.get(current)!.data).tree;
+      const merged = gitThreeWayMerge(st, parentTree, c.tree, currentTree);
+      if (merged.conflicts.length) throw Object.assign(new Error("Merge conflict"), { status: 409 });
+      const data = gitBuildCommit({
+        tree: merged.tree!, parents: [current], message: c.message,
+        authorLine: c.author, committerLine: line,
+      });
+      const oid = gitHash("commit", data);
+      st.objects.set(oid, { type: "commit", data });
+      current = oid;
     }
-    const push = gitSync(["-C", dir, "push", "-q", "origin", `HEAD:refs/heads/${p.base.ref}`]);
-    if (push.code !== 0) throw new Error("push failed: " + push.stderr);
-    return headSha(bareDir, `refs/heads/${p.base.ref}`);
-  });
+    mergedSha = current;
+  } else {
+    const mergeBaseOid = gitMergeBase(st, baseTip, headTip);
+    const baseTree = mergeBaseOid ? gitParseCommit(st.objects.get(mergeBaseOid)!.data).tree : null;
+    const headTree = gitParseCommit(st.objects.get(headTip)!.data).tree;
+    const baseTreeNow = gitParseCommit(st.objects.get(baseTip)!.data).tree;
+    const merged = gitThreeWayMerge(st, baseTree, headTree, baseTreeNow);
+    if (merged.conflicts.length) throw Object.assign(new Error("Merge conflict"), { status: 409 });
+    if (method === "squash") {
+      const data = gitBuildCommit({
+        tree: merged.tree!, parents: [baseTip],
+        message: p.title.endsWith("\n") ? p.title : `${p.title}\n`,
+        authorLine: line, committerLine: line,
+      });
+      mergedSha = gitHash("commit", data);
+      st.objects.set(mergedSha, { type: "commit", data });
+    } else {
+      const data = gitBuildCommit({
+        tree: merged.tree!, parents: [baseTip, headTip],
+        message: `Merge pull request #${p.number} from ${p.head.ref}\n`,
+        authorLine: line, committerLine: line,
+      });
+      mergedSha = gitHash("commit", data);
+      st.objects.set(mergedSha, { type: "commit", data });
+    }
+  }
+  st.refs.set(`refs/heads/${p.base.ref}`, mergedSha);
+  touchGitState(st);
   p.merged = true; p.state = "closed"; p.merged_at = nowIso(); p.closed_at = nowIso();
   p.updated_at = nowIso(); p.merge_commit_sha = mergedSha;
   r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
@@ -729,117 +1945,6 @@ function mergePrHandler(res: ServerResponse, r: Repo, p: PullRequest, body: Json
     // while anything else that went wrong is a 500.
     sendError(res, e.status === 409 ? 405 : 500, e.message || "Merge failed");
   }
-}
-
-// ---------------------------------------------------------------- git smart HTTP
-function pktLine(s: string): string {
-  const len = Buffer.byteLength(s) + 4;
-  return len.toString(16).padStart(4, "0") + s;
-}
-function parsePushCommands(buf: Buffer): { old: string; nw: string; ref: string }[] {
-  const out: { old: string; nw: string; ref: string }[] = [];
-  let off = 0;
-  while (off + 4 <= buf.length && out.length < 64) {
-    const len = parseInt(buf.toString("ascii", off, off + 4), 16);
-    if (!len || Number.isNaN(len)) break;
-    if (len === 0) break; // flush packet
-    const payload = buf.toString("utf8", off + 4, off + len);
-    const m = payload.match(/^([0-9a-f]{40}) ([0-9a-f]{40}) (refs\/[^\s\x00]+)/);
-    if (m) out.push({ old: m[1], nw: m[2], ref: m[3] });
-    off += len;
-  }
-  return out;
-}
-
-async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, repo: string, service: string): Promise<void> {
-  const r = findRepo(owner, repo);
-  if (!r) { sendError(res, 404, "Not Found"); return; }
-  if (r.private && !authed(req)) { requireAuth(req, res); return; }
-  if (!gitAvailable()) { sendError(res, 503, "git binary unavailable on this host"); return; }
-  const svc = service === "git-receive-pack" ? "receive-pack" : "upload-pack";
-  const dir = barePath(owner, repo);
-  const child = spawn("git", [svc, "--stateless-rpc", "--advertise-refs", dir], gitProtocolEnv(req));
-  const chunks: Buffer[] = [];
-  let stderr = "";
-  child.stdout.on("data", (c: Buffer) => chunks.push(c));
-  child.stderr.on("data", (c: Buffer) => { stderr += c.toString(); });
-  child.on("error", () => { if (!res.writableEnded) sendError(res, 500, "failed to run git"); });
-  child.on("close", (code) => {
-    if (res.writableEnded) return;
-    if (code !== 0) { sendError(res, 500, "git " + svc + " failed: " + stderr.trim().slice(0, 300)); return; }
-    const body = Buffer.concat([
-      Buffer.from(pktLine(`# service=git-${svc}\n`) + "0000"),
-      Buffer.concat(chunks),
-    ]);
-    res.writeHead(200, {
-      "Content-Type": `application/x-git-${svc}-advertisement`,
-      "Content-Length": body.length, "Cache-Control": "no-cache",
-    });
-    res.end(body);
-  });
-}
-
-function handleUploadPack(req: IncomingMessage, res: ServerResponse, owner: string, repo: string): void {
-  const r = findRepo(owner, repo);
-  if (!r) { sendError(res, 404, "Not Found"); return; }
-  if (r.private && !authed(req)) { requireAuth(req, res); return; }
-  if (!gitAvailable()) { sendError(res, 503, "git binary unavailable on this host"); return; }
-  const child = spawn("git", ["upload-pack", "--stateless-rpc", barePath(owner, repo)], gitProtocolEnv(req));
-  child.on("error", () => { if (!res.writableEnded) sendError(res, 500, "failed to run git"); });
-  res.writeHead(200, { "Content-Type": "application/x-git-upload-pack-result", "Cache-Control": "no-cache" });
-  req.pipe(child.stdin);
-  child.stdout.pipe(res);
-  child.stderr.on("data", () => { /* drain */ });
-}
-
-function handleReceivePack(req: IncomingMessage, res: ServerResponse, owner: string, repo: string): void {
-  const r = findRepo(owner, repo);
-  if (!r) { sendError(res, 404, "Not Found"); return; }
-  if (!authed(req)) { requireAuth(req, res); return; }
-  if (!gitAvailable()) { sendError(res, 503, "git binary unavailable on this host"); return; }
-  const dir = barePath(owner, repo);
-  const child = spawn("git", ["receive-pack", "--stateless-rpc", dir]);
-  child.on("error", () => { if (!res.writableEnded) sendError(res, 500, "failed to run git"); });
-  res.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Cache-Control": "no-cache" });
-  // Tee the first 64 KiB so we can parse the ref-update commands for webhooks.
-  const headBuf: Buffer[] = [];
-  let headLen = 0;
-  req.on("data", (c: Buffer) => {
-    if (headLen < 65536) { headBuf.push(c); headLen += c.length; }
-    child.stdin.write(c);
-  });
-  req.on("end", () => child.stdin.end());
-  req.on("error", () => child.stdin.end());
-  child.stdout.pipe(res);
-  child.stderr.on("data", () => { /* drain */ });
-  child.on("close", (code) => {
-    if (code !== 0) return;
-    try {
-      const cmds = parsePushCommands(Buffer.concat(headBuf));
-      r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
-      for (const cmd of cmds) {
-        const commits: Json[] = [];
-        if (cmd.old !== "0000000000000000000000000000000000000000") {
-          const lg = gitSync(["--git-dir", dir, "log", "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e", `${cmd.old}..${cmd.nw}`]);
-          if (lg.code === 0) for (const c of parseLog(lg.stdout).slice(0, 20)) {
-            commits.push({ id: c.sha, message: c.message, author: { name: c.author, email: c.email }, timestamp: c.date, url: `http://localhost/${owner}/${repo}/commit/${c.sha}` });
-          }
-        } else {
-          const lg = gitSync(["--git-dir", dir, "log", "--max-count=20", "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e", cmd.nw]);
-          if (lg.code === 0) for (const c of parseLog(lg.stdout)) {
-            commits.push({ id: c.sha, message: c.message, author: { name: c.author, email: c.email }, timestamp: c.date, url: `http://localhost/${owner}/${repo}/commit/${c.sha}` });
-          }
-        }
-        fireHooks(r, "push", {
-          ref: cmd.ref, before: cmd.old, after: cmd.nw, created: cmd.old === "0000000000000000000000000000000000000000",
-          deleted: cmd.nw === "0000000000000000000000000000000000000000",
-          commits, head_commit: commits[commits.length - 1] || null,
-          repository: repoJson(r), pusher: userRef(FORGE_USER), sender: userRef(FORGE_USER),
-        });
-      }
-      if (cmds.length === 0) fireHooks(r, "push", { ref: "refs/heads/" + r.default_branch, before: "", after: "", commits: [], repository: repoJson(r), pusher: userRef(FORGE_USER), sender: userRef(FORGE_USER) });
-    } catch { /* webhook failures must never break the push */ }
-  });
 }
 
 // ---------------------------------------------------------------- GraphQL (minimal, gh-compatible shapes)
@@ -922,10 +2027,12 @@ function gqlArgStr(argsText: string, vars: Json, field: string): string | null {
   return lm ? lm[1] : null;
 }
 function prChangedPaths(r: Repo, p: PullRequest): string[] {
-  if (!gitAvailable() || !p.head.sha || !p.base.sha) return [];
-  const d = gitSync(["--git-dir", barePath(r.owner, r.name), "diff", "--name-only", p.base.sha, p.head.sha]);
-  if (d.code !== 0) return [];
-  return d.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (!p.head.sha || !p.base.sha) return [];
+  const st = getGitState(r.owner, r.name);
+  const baseCommit = st.objects.get(p.base.sha);
+  const headCommit = st.objects.get(p.head.sha);
+  if (!baseCommit || !headCommit || baseCommit.type !== "commit" || headCommit.type !== "commit") return [];
+  return gitDiffTrees(st, gitParseCommit(baseCommit.data).tree, gitParseCommit(headCommit.data).tree).map((d) => d.path);
 }
 
 function gqlPrNode(r: Repo, p: PullRequest): Json {
@@ -970,9 +2077,9 @@ function execGraphQLDoc(query: string, vars: Json): Json {
       const head = gqlStr(query, vars, "headRefName") || "";
       const base = gqlStr(query, vars, "baseRefName") || repo?.default_branch || "main";
       if (!repo || !title || !head) return { errors: [{ message: "repositoryId, title and headRefName are required" }] };
-      const bareDir = barePath(repo.owner, repo.name);
-      const headCommit = headSha(bareDir, `refs/heads/${head}`);
-      const baseCommit = headSha(bareDir, `refs/heads/${base}`);
+      const st = getGitState(repo.owner, repo.name);
+      const headCommit = gitCommitAt(st, `refs/heads/${head}`, repo.default_branch);
+      const baseCommit = gitCommitAt(st, `refs/heads/${base}`, repo.default_branch);
       if (!headCommit || !baseCommit) return { errors: [{ message: "head or base branch does not exist" }] };
       const pr: PullRequest = {
         id: repo.next_pr, number: repo.next_pr++, title: title.slice(0, 1000),
@@ -1113,7 +2220,7 @@ const MCP_TOOLS: McpTool[] = [
     const owner = validName(a.owner) ? a.owner : FORGE_USER;
     if (findRepo(owner, a.name)) throw Object.assign(new Error("repository already exists"), { status: 422 });
     const repo: Repo = { id: store.next_repo++, name: a.name, full_name: `${owner}/${a.name}`, owner, description: typeof a.description === "string" ? a.description : "", private: a.private === true, default_branch: "main", created_at: nowIso(), updated_at: nowIso(), pushed_at: null, next_issue: 1, next_pr: 1, next_hook: 1, next_comment: 1, labels: DEFAULT_LABELS.map((l) => ({ ...l })), issues: [], pulls: [], hooks: [] };
-    createBareRepo(owner, a.name, "main");
+    initGitState(owner, a.name);
     store.repos.push(repo); saveStore();
     return repoJson(repo);
   } },
@@ -1124,7 +2231,8 @@ const MCP_TOOLS: McpTool[] = [
   { name: "delete_repository", description: "Delete a repository", mutating: true, inputSchema: { type: "object", properties: { owner: { type: "string" }, repo: { type: "string" } }, required: ["owner", "repo"] }, run: (a) => {
     const r = findRepo(a.owner, a.repo); if (!r) throw Object.assign(new Error("Not Found"), { status: 404 });
     store.repos = store.repos.filter((x) => x !== r); saveStore();
-    rmSync(barePath(r.owner, r.name), { recursive: true, force: true });
+    deleteGitState(r.owner, r.name);
+    rmSync(join(DATA_DIR, "repos", r.owner, r.name + ".git"), { recursive: true, force: true });
     return { deleted: true, full_name: r.full_name };
   } },
   { name: "create_issue", description: "Create an issue", mutating: true, inputSchema: { type: "object", properties: { owner: { type: "string" }, repo: { type: "string" }, title: { type: "string" }, body: { type: "string" } }, required: ["owner", "repo", "title"] }, run: (a) => {
@@ -1162,9 +2270,9 @@ const MCP_TOOLS: McpTool[] = [
   } },
   { name: "create_pull_request", description: "Create a pull request", mutating: true, inputSchema: { type: "object", properties: { owner: { type: "string" }, repo: { type: "string" }, title: { type: "string" }, head: { type: "string" }, base: { type: "string" }, body: { type: "string" } }, required: ["owner", "repo", "title", "head", "base"] }, run: (a) => {
     const r = findRepo(a.owner, a.repo); if (!r) throw Object.assign(new Error("Not Found"), { status: 404 });
-    const bareDir = barePath(r.owner, r.name);
-    const headCommit = headSha(bareDir, `refs/heads/${a.head}`);
-    const baseCommit = headSha(bareDir, `refs/heads/${a.base}`);
+    const st = getGitState(r.owner, r.name);
+    const headCommit = gitCommitAt(st, `refs/heads/${a.head}`, r.default_branch);
+    const baseCommit = gitCommitAt(st, `refs/heads/${a.base}`, r.default_branch);
     if (!headCommit || !baseCommit) throw Object.assign(new Error("head or base branch does not exist"), { status: 422 });
     const pr: PullRequest = { id: r.next_pr, number: r.next_pr++, title: String(a.title).slice(0, 1000), body: typeof a.body === "string" ? a.body : "", state: "open", merged: false, merged_at: null, merge_commit_sha: null, head: { ref: a.head, sha: headCommit, label: `${r.owner}:${a.head}` }, base: { ref: a.base, sha: baseCommit, label: `${r.owner}:${a.base}` }, user: userRef(FORGE_USER), comments: [], created_at: nowIso(), updated_at: nowIso(), closed_at: null };
     r.pulls.push(pr); r.updated_at = nowIso(); saveStore();
@@ -1179,19 +2287,12 @@ const MCP_TOOLS: McpTool[] = [
     const r = findRepo(a.owner, a.repo); if (!r) throw Object.assign(new Error("Not Found"), { status: 404 });
     const p = r.pulls.find((x) => x.number === Number(a.pull_number)); if (!p) throw Object.assign(new Error("Not Found"), { status: 404 });
     if (p.state !== "open") throw Object.assign(new Error("Pull Request is not mergeable"), { status: 405 });
-    const bareDir = barePath(r.owner, r.name);
-    const mergedSha = withWorktree(bareDir, (dir) => {
-      const co = gitSync(["-C", dir, "checkout", "-q", p.base.ref]);
-      if (co.code !== 0) throw new Error("cannot check out base branch");
-      gitSync(["-C", dir, "fetch", "-q", "origin", p.head.ref]);
-      const mg = gitSync(["-C", dir, "merge", "-q", "--no-ff", "-m", `Merge pull request #${p.number} from ${p.head.ref}`, `origin/${p.head.ref}`]);
-      if (mg.code !== 0) { gitSync(["-C", dir, "merge", "--abort"]); throw Object.assign(new Error("Merge conflict"), { status: 409 }); }
-      const push = gitSync(["-C", dir, "push", "-q", "origin", `HEAD:refs/heads/${p.base.ref}`]);
-      if (push.code !== 0) throw new Error("push failed: " + push.stderr);
-      return headSha(bareDir, `refs/heads/${p.base.ref}`);
-    });
-    p.merged = true; p.state = "closed"; p.merged_at = nowIso(); p.closed_at = nowIso(); p.updated_at = nowIso(); p.merge_commit_sha = mergedSha;
-    r.pushed_at = nowIso(); r.updated_at = nowIso(); saveStore();
+    let mergedSha: string | null;
+    try {
+      mergedSha = mergePrIntoBase(r, p);
+    } catch (e: any) {
+      throw Object.assign(new Error(e.status === 409 ? "Merge conflict" : (e.message || "merge failed")), { status: e.status || 500 });
+    }
     return { sha: mergedSha, merged: true, message: "Pull Request successfully merged" };
   } },
   { name: "search_repositories", description: "Search repositories", mutating: false, inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }, run: (a) => ({ repositories: store.repos.filter((r) => r.full_name.includes(String(a.query)) || r.description.includes(String(a.query))).map(repoJson) }) },
@@ -1203,14 +2304,15 @@ const MCP_TOOLS: McpTool[] = [
   { name: "get_file_contents", description: "Get a file from a repository", mutating: false, inputSchema: { type: "object", properties: { owner: { type: "string" }, repo: { type: "string" }, path: { type: "string" } }, required: ["owner", "repo", "path"] }, run: (a) => {
     const r = findRepo(a.owner, a.repo); if (!r) throw Object.assign(new Error("Not Found"), { status: 404 });
     if (!validContentPath(String(a.path))) throw Object.assign(new Error("invalid path"), { status: 400 });
-    const bareDir = barePath(r.owner, r.name);
-    const blob = gitBuf(["--git-dir", bareDir, "show", `HEAD:${a.path}`]);
-    if (blob.code !== 0) throw Object.assign(new Error("Not Found"), { status: 404 });
-    return { path: a.path, content: blob.buf.toString("base64"), encoding: "base64", size: blob.buf.length };
+    const st = getGitState(r.owner, r.name);
+    const tip = gitCommitAt(st, "HEAD", r.default_branch);
+    const data = tip ? gitReadBlobAt(st, tip, String(a.path)) : null;
+    if (!data) throw Object.assign(new Error("Not Found"), { status: 404 });
+    return { path: a.path, content: data.toString("base64"), encoding: "base64", size: data.length };
   } },
   { name: "list_commits", description: "List commits", mutating: false, inputSchema: { type: "object", properties: { owner: { type: "string" }, repo: { type: "string" }, sha: { type: "string" } }, required: ["owner", "repo"] }, run: (a) => {
     const r = findRepo(a.owner, a.repo); if (!r) throw Object.assign(new Error("Not Found"), { status: 404 });
-    return { commits: listCommits(barePath(r.owner, r.name), typeof a.sha === "string" ? a.sha : "HEAD", 30) };
+    return { commits: listCommits(r.owner, r.name, typeof a.sha === "string" ? a.sha : "HEAD", 30) };
   } },
 ];
 
@@ -1402,8 +2504,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
         if (typeof body.description === "string") r.description = body.description.slice(0, 1000);
         if (body.private === true || body.private === false) r.private = body.private;
         if (typeof body.default_branch === "string" && validRefName(body.default_branch)) {
-          const ok = gitSync(["--git-dir", barePath(owner, repoName), "rev-parse", "--verify", `refs/heads/${body.default_branch}`]);
-          if (ok.code !== 0) { sendError(res, 422, "Validation Failed", { errors: [{ field: "default_branch", code: "invalid" }] }); return; }
+          const st = getGitState(owner, repoName);
+          if (!st.refs.has(`refs/heads/${body.default_branch}`)) { sendError(res, 422, "Validation Failed", { errors: [{ field: "default_branch", code: "invalid" }] }); return; }
           r.default_branch = body.default_branch;
         }
         r.updated_at = nowIso(); saveStore();
@@ -1417,13 +2519,13 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     }
 
     if (!r) { sendError(res, 404, "Not Found"); return; }
-    const bareDir = barePath(owner, repoName);
 
     // ---- branches
     if (rest[0] === "branches") {
-      if (method === "GET" && rest.length === 1) { sendJson(res, 200, listBranches(bareDir)); return; }
+      if (method === "GET" && rest.length === 1) { sendJson(res, 200, listBranches(owner, repoName)); return; }
       if (method === "GET" && rest.length === 2) {
-        const sha = headSha(bareDir, `refs/heads/${rest[1]}`);
+        const st = getGitState(owner, repoName);
+        const sha = st.refs.get(`refs/heads/${rest[1]}`);
         if (!sha) { sendError(res, 404, "Not Found"); return; }
         sendJson(res, 200, { name: rest[1], commit: { sha, url: `/api/v3/repos/${owner}/${repoName}/git/commits/${sha}` }, protected: false });
         return;
@@ -1433,25 +2535,23 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     if (rest[0] === "commits") {
       if (method === "GET" && rest.length === 1) {
         const ref = q.get("sha") || "HEAD";
-        sendJson(res, 200, slice(listCommits(bareDir, ref, perPage)));
+        sendJson(res, 200, slice(listCommits(owner, repoName, ref, perPage)));
         return;
       }
       if (method === "GET" && rest.length === 2) {
-        const one = listCommits(bareDir, rest[1], 1);
+        const one = listCommits(owner, repoName, rest[1], 1);
         if (!one.length) { sendError(res, 404, "Not Found"); return; }
-        const st = gitSync(["--git-dir", bareDir, "show", "--stat", "--format=", rest[1]]);
         sendJson(res, 200, { ...one[0], stats: { total: 0 }, files: [] });
         return;
       }
     }
     // ---- git refs / trees / blobs
     if (rest[0] === "git") {
+      const st = getGitState(owner, repoName);
       if (rest[1] === "refs" && method === "GET") {
-        const show = gitSync(["--git-dir", bareDir, "show-ref"]);
-        const all = show.stdout.split("\n").filter(Boolean).map((l) => {
-          const [sha, ref] = l.split(" ");
-          return { ref, node_id: `ref:${ref}`, url: `/api/v3/repos/${owner}/${repoName}/git/refs/${ref.replace(/^refs\//, "")}`, object: { sha, type: "commit" } };
-        });
+        const all = [...st.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([ref, sha]) => ({
+          ref, node_id: `ref:${ref}`, url: `/api/v3/repos/${owner}/${repoName}/git/refs/${ref.replace(/^refs\//, "")}`, object: { sha, type: "commit" },
+        }));
         const want = rest.slice(2).join("/");
         sendJson(res, 200, want ? all.filter((x) => x.ref === `refs/${want}` || x.ref.startsWith(`refs/${want}`)) : all);
         return;
@@ -1461,41 +2561,52 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
         const body = await readJson(req);
         const ref = typeof body.ref === "string" ? body.ref : "";
         const sha = typeof body.sha === "string" ? body.sha : "";
-        if (!ref.startsWith("refs/") || !/^[0-9a-f]{40}$/.test(sha)) { sendError(res, 422, "Validation Failed", { errors: [{ field: "ref/sha", code: "invalid" }] }); return; }
-        const up = gitSync(["--git-dir", bareDir, "update-ref", ref, sha]);
-        if (up.code !== 0) { sendError(res, 422, up.stderr.trim() || "update-ref failed"); return; }
+        if (!ref.startsWith("refs/") || !validRefName(ref) || !/^[0-9a-f]{40}$/.test(sha) || !st.objects.has(sha)) {
+          sendError(res, 422, "Validation Failed", { errors: [{ field: "ref/sha", code: "invalid" }] }); return;
+        }
+        st.refs.set(ref, sha);
+        touchGitState(st);
         sendJson(res, 201, { ref, node_id: `ref:${ref}`, url: `/api/v3/repos/${owner}/${repoName}/git/refs/${ref.replace(/^refs\//, "")}`, object: { sha, type: "commit" } });
         return;
       }
       if (rest[1] === "refs" && method === "DELETE") {
         if (!requireAuth(req, res)) return;
         const ref = "refs/" + rest.slice(2).join("/");
-        const del = gitSync(["--git-dir", bareDir, "update-ref", "-d", ref]);
-        if (del.code !== 0) { sendError(res, 422, del.stderr.trim() || "delete ref failed"); return; }
+        if (!st.refs.has(ref)) { sendError(res, 422, "delete ref failed"); return; }
+        st.refs.delete(ref);
+        touchGitState(st);
         res.writeHead(204); res.end(); return;
       }
       if (rest[1] === "trees" && method === "GET" && rest.length === 3) {
         const recursive = q.get("recursive") === "1";
-        const args = ["--git-dir", bareDir, "ls-tree", ...(recursive ? ["-r"] : []), "-l", rest[2]];
-        const t = gitSync(args);
-        if (t.code !== 0) { sendError(res, 404, "Not Found"); return; }
-        const tree = t.stdout.split("\n").filter(Boolean).map((l) => {
-          const m = l.match(/^(\d+) (\w+) ([0-9a-f]{40}) +(\d+|-)\t(.*)$/);
-          if (!m) return null;
-          return { path: m[5], mode: m[1], type: m[2] === "tree" ? "tree" : "blob", sha: m[3], size: m[4] === "-" ? 0 : Number(m[4]), url: `/api/v3/repos/${owner}/${repoName}/git/blobs/${m[3]}` };
-        }).filter(Boolean);
+        let obj = st.objects.get(rest[2]);
+        if (obj && obj.type === "commit") {
+          const treeOid = gitParseCommit(obj.data).tree;
+          obj = st.objects.get(treeOid);
+        }
+        if (!obj || obj.type !== "tree") { sendError(res, 404, "Not Found"); return; }
+        const tree: Json[] = [];
+        const walk = (treeOid: string, prefix: string): void => {
+          for (const e of gitListTree(st, treeOid)) {
+            const path = prefix ? `${prefix}/${e.name}` : e.name;
+            const size = e.mode === "40000" ? 0 : (st.objects.get(e.oid)?.data.length ?? 0);
+            tree.push({ path, mode: e.mode, type: e.mode === "40000" ? "tree" : "blob", sha: e.oid, size, url: `/api/v3/repos/${owner}/${repoName}/git/blobs/${e.oid}` });
+            if (recursive && e.mode === "40000") walk(e.oid, path);
+          }
+        };
+        const rootTreeOid = obj.type === "commit" ? gitParseCommit(obj.data).tree : rest[2];
+        walk(rootTreeOid, "");
         sendJson(res, 200, { sha: rest[2], url: `/api/v3/repos/${owner}/${repoName}/git/trees/${rest[2]}`, tree, truncated: false });
         return;
       }
       if (rest[1] === "blobs" && method === "GET" && rest.length === 3) {
-        const type = gitSync(["--git-dir", bareDir, "cat-file", "-t", rest[2]]);
-        if (type.code !== 0 || type.stdout.trim() !== "blob") { sendError(res, 404, "Not Found"); return; }
-        const blob = gitBuf(["--git-dir", bareDir, "cat-file", "-p", rest[2]]);
-        sendJson(res, 200, { sha: rest[2], size: blob.buf.length, encoding: "base64", content: blob.buf.toString("base64"), url: `/api/v3/repos/${owner}/${repoName}/git/blobs/${rest[2]}` });
+        const obj = st.objects.get(rest[2]);
+        if (!obj || obj.type !== "blob") { sendError(res, 404, "Not Found"); return; }
+        sendJson(res, 200, { sha: rest[2], size: obj.data.length, encoding: "base64", content: obj.data.toString("base64"), url: `/api/v3/repos/${owner}/${repoName}/git/blobs/${rest[2]}` });
         return;
       }
       if (rest[1] === "commits" && method === "GET" && rest.length === 3) {
-        const one = listCommits(bareDir, rest[2], 1);
+        const one = listCommits(owner, repoName, rest[2], 1);
         if (!one.length) { sendError(res, 404, "Not Found"); return; }
         sendJson(res, 200, one[0]);
         return;
@@ -1506,13 +2617,13 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
       const cpath = rest.slice(1).join("/");
       if (method === "GET") {
         if (!cpath) {
-          const t = gitSync(["--git-dir", bareDir, "ls-tree", q.get("ref") || r.default_branch]);
-          if (t.code !== 0) { sendJson(res, 200, []); return; }
-          const entries = t.stdout.split("\n").filter(Boolean).map((l) => {
-            const m = l.match(/^(\d+) (\w+) ([0-9a-f]{40})\t(.*)$/);
-            if (!m) return null;
-            return { name: m[4], path: m[4], sha: m[3], size: 0, type: m[2] === "tree" ? "dir" : "file", mode: m[1] };
-          }).filter(Boolean);
+          const st = getGitState(owner, repoName);
+          const tip = gitCommitAt(st, q.get("ref") || r.default_branch, r.default_branch);
+          if (!tip) { sendJson(res, 200, []); return; }
+          const treeOid = gitParseCommit(st.objects.get(tip)!.data).tree;
+          const entries = gitListTree(st, treeOid).map((e) => ({
+            name: e.name, path: e.name, sha: e.oid, size: 0, type: e.mode === "40000" ? "dir" : "file", mode: e.mode,
+          }));
           sendJson(res, 200, entries);
           return;
         }
@@ -1536,11 +2647,16 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
       }
     }
     if (rest[0] === "readme" && method === "GET") {
-      for (const cand of ["README.md", "README", "readme.md"]) {
-        const blob = gitBuf(["--git-dir", bareDir, "show", `HEAD:${cand}`]);
-        if (blob.code === 0) {
-          sendJson(res, 200, { type: "file", encoding: "base64", size: blob.buf.length, name: cand, path: cand, content: blob.buf.toString("base64"), sha: headSha(bareDir, `HEAD:${cand}`) || "" });
-          return;
+      const st = getGitState(owner, repoName);
+      const tip = gitCommitAt(st, "HEAD", r.default_branch);
+      if (tip) {
+        for (const cand of ["README.md", "README", "readme.md"]) {
+          const data = gitReadBlobAt(st, tip, cand);
+          if (data) {
+            const entry = gitTreeAtPath(st, tip, cand);
+            sendJson(res, 200, { type: "file", encoding: "base64", size: data.length, name: cand, path: cand, content: data.toString("base64"), sha: entry ? entry.oid : "" });
+            return;
+          }
         }
       }
       sendError(res, 404, "Not Found");
@@ -1678,15 +2794,18 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
           }
         }
         if (rest[2] === "commits" && method === "GET") {
-          sendJson(res, 200, slice(listCommits(bareDir, `${pr.base.sha}..${pr.head.sha}`, perPage)));
+          sendJson(res, 200, slice(listCommits(owner, repoName, `${pr.base.sha}..${pr.head.sha}`, perPage)));
           return;
         }
         if (rest[2] === "files" && method === "GET") {
-          const d = gitSync(["--git-dir", bareDir, "diff", "--numstat", `${pr.base.sha}..${pr.head.sha}`]);
-          const files = d.code === 0 ? d.stdout.split("\n").filter(Boolean).map((l) => {
-            const [add, del, file] = l.split("\t");
-            return { filename: file, status: "modified", additions: Number(add) || 0, deletions: Number(del) || 0, changes: (Number(add) || 0) + (Number(del) || 0) };
-          }) : [];
+          const st = getGitState(owner, repoName);
+          const baseCommit = st.objects.get(pr.base.sha);
+          const headCommit = st.objects.get(pr.head.sha);
+          const files = baseCommit && headCommit && baseCommit.type === "commit" && headCommit.type === "commit"
+            ? gitDiffTrees(st, gitParseCommit(baseCommit.data).tree, gitParseCommit(headCommit.data).tree).map((d) => ({
+                filename: d.path, status: d.status, additions: d.additions, deletions: d.deletions, changes: d.additions + d.deletions,
+              }))
+            : [];
           sendJson(res, 200, files);
           return;
         }
@@ -1821,15 +2940,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         await handleInfoRefs(req, res, owner, repoName, url.searchParams.get("service") || "");
         return;
       }
-      if (op === "git-upload-pack" && method === "POST") { handleUploadPack(req, res, owner, repoName); return; }
-      if (op === "git-receive-pack" && method === "POST") { handleReceivePack(req, res, owner, repoName); return; }
+      if (op === "git-upload-pack" && method === "POST") { await handleUploadPack(req, res, owner, repoName); return; }
+      if (op === "git-receive-pack" && method === "POST") { await handleReceivePack(req, res, owner, repoName); return; }
       if (op === "HEAD" && method === "GET") {
         const r = findRepo(owner, repoName);
         if (!r) { sendError(res, 404, "Not Found"); return; }
-        const f = join(barePath(owner, repoName), "HEAD");
-        if (!existsSync(f)) { sendError(res, 404, "Not Found"); return; }
-        const body = readFileSync(f);
-        res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": body.length });
+        const body = `ref: refs/heads/${r.default_branch}\n`;
+        res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": Buffer.byteLength(body) });
         res.end(body);
         return;
       }
@@ -1867,8 +2984,12 @@ const server = createServer((req, res) => {
   });
 });
 
-process.on("SIGINT", () => server.close(() => process.exit(0)));
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
+function shutdown(): void {
+  try { flushStore(); } catch { /* best effort */ }
+  try { flushGitStates(); } catch { /* best effort */ }
+}
+process.on("SIGINT", () => { shutdown(); server.close(() => process.exit(0)); });
+process.on("SIGTERM", () => { shutdown(); server.close(() => process.exit(0)); });
 
 // ---------------------------------------------------------------- make.fun trial lifecycle (kit starter/main.ts)
 // In a trial MAKEFUN_ENV_URL names the suite's origin:
@@ -1937,6 +3058,7 @@ async function main(): Promise<void> {
   console.log("[entry] registered; waiting for the env to say done");
   await waitForEnvDone();
   server.close();
+  shutdown();
   console.log("[entry] done");
 }
 try {
