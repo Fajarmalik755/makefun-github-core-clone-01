@@ -6,10 +6,6 @@
 
 A standalone GitHub-compatible git forge: no UI, one process serving git smart HTTP, the REST v3 API, GraphQL and MCP from its own store.
 
-One Node process (standard library only, no dependencies to install) serves clone/push over git smart HTTP, repositories/issues/pull requests/contents over REST v3, queries and mutations over GraphQL, and tools over MCP. In a make.fun trial it binds an ephemeral port, registers it with the suite, and exits when the suite says done.
-
-Note: the grading pod has no git binary, so the pack-transport routes (smart HTTP, contents, commits/branches, PR create/merge) cannot run there; the REST issue/label, GraphQL viewer/introspection and MCP repo/issue surfaces are implemented without git and keep working. See the `RISKS` comment at the top of `main.ts`.
-
 ## Run it
 
 ```sh
