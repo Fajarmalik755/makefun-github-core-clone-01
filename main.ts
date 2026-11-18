@@ -30,6 +30,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
 
+/** Name of this entry, used in the startup log so the log identifies the forge. */
+const ENTRY_NAME = 'github-core-clone-01';
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
@@ -85,7 +88,7 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  process.stdout.write(`[entry] ${ENTRY_NAME} listening on port ${address.port}\n`);
 
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
